@@ -2,13 +2,16 @@ use crate::cfproxy::*;
 use crate::config::*;
 use crate::crypto::*;
 use crate::faketls;
+use crate::h2media;
 use crate::ws::*;
 use crate::{ldebug, linfo, lwarn};
 use byteorder::{ByteOrder, LittleEndian};
+use once_cell::sync::Lazy;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,6 +31,36 @@ pub fn ws_pool_fronting_first() -> bool {
 
 pub fn set_ws_pool_fronting_first(v: bool) {
     TRY_FRONTING_FIRST.store(v, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// TCP fallback backoff — порт bridge.py::_tcp_fallback (L251-284).
+// Ключ (dst, port): при неудаче failures += 1, delay = min(30 * 2^min(n-1,7), 3600).
+// ---------------------------------------------------------------------------
+
+const TCP_BACKOFF_INITIAL: f64 = 30.0;
+const TCP_BACKOFF_MAX: f64 = 3600.0;
+
+pub struct TcpFallbackState {
+    failures: HashMap<(String, u16), u32>,
+    retry_after: HashMap<(String, u16), f64>,
+    connecting: HashSet<(String, u16)>,
+}
+
+pub static TCP_FALLBACK: Lazy<StdMutex<TcpFallbackState>> = Lazy::new(|| {
+    StdMutex::new(TcpFallbackState {
+        failures: HashMap::new(),
+        retry_after: HashMap::new(),
+        connecting: HashSet::new(),
+    })
+});
+
+/// bridge.py L29-33: reset на старте/остановке.
+pub fn reset_tcp_backoff() {
+    let mut s = TCP_FALLBACK.lock().unwrap();
+    s.failures.clear();
+    s.retry_after.clear();
+    s.connecting.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,25 +1194,83 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
+    // bridge.py: skip при уже идущем подключении или в backoff.
+    let key = (dst.to_string(), port);
+    {
+        let mut s = TCP_FALLBACK.lock().unwrap();
+        if s.connecting.contains(&key)
+            || now_monotonic() < s.retry_after.get(&key).copied().unwrap_or(0.0)
+        {
+            ldebug!(
+                "[{}] TCP fallback to {}:{} skipped (backoff or connecting)",
+                label, dst, port
+            );
+            return false;
+        }
+        s.connecting.insert(key.clone());
+    }
+
     let addr = format!("{}:{}", dst, port);
-    let mut remote =
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, e);
-                return false;
-            }
-            Err(_) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: timeout", label, dst, port);
-                return false;
-            }
-        };
+    let remote_res = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await
+    {
+        Ok(Ok(r)) => Ok(r),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        )),
+    };
+    let remote = match remote_res {
+        Ok(r) => r,
+        Err(e) => {
+            let delay = {
+                let mut s = TCP_FALLBACK.lock().unwrap();
+                s.connecting.remove(&key);
+                let failures = s.failures.get(&key).copied().unwrap_or(0) + 1;
+                s.failures.insert(key.clone(), failures);
+                let delay = (TCP_BACKOFF_INITIAL * 2f64.powi((failures - 1).min(7) as i32))
+                    .min(TCP_BACKOFF_MAX);
+                s.retry_after.insert(key, now_monotonic() + delay);
+                delay
+            };
+            lwarn!(
+                "[{}] TCP fallback to {}:{} failed: {}; retry in {:.0}s",
+                label, dst, port, e, delay
+            );
+            return false;
+        }
+    };
+    let mut remote = remote;
     let _ = remote.set_nodelay(true);
 
-    STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
-    if remote.write_all(init).await.is_err() {
+    let write_ok = remote.write_all(init).await.is_ok();
+    {
+        let mut s = TCP_FALLBACK.lock().unwrap();
+        s.connecting.remove(&key);
+    }
+    if !write_ok {
+        let delay = {
+            let mut s = TCP_FALLBACK.lock().unwrap();
+            let failures = s.failures.get(&key).copied().unwrap_or(0) + 1;
+            s.failures.insert(key.clone(), failures);
+            let delay = (TCP_BACKOFF_INITIAL * 2f64.powi((failures - 1).min(7) as i32))
+                .min(TCP_BACKOFF_MAX);
+            s.retry_after.insert(key, now_monotonic() + delay);
+            delay
+        };
+        lwarn!(
+            "[{}] TCP fallback to {}:{} failed: write error; retry in {:.0}s",
+            label, dst, port, delay
+        );
         return false;
     }
+
+    {
+        let mut s = TCP_FALLBACK.lock().unwrap();
+        s.failures.remove(&key);
+        s.retry_after.remove(&key);
+    }
+    STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
     let (clt_dec, clt_enc, tg_enc, tg_dec) = ctx_streams;
     bridge_tcp(
         conn_read,
@@ -1196,64 +1287,18 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Cfproxy fallback — мобильная версия (параллель + 429 cooldown + DoH),
+// Cfproxy fallback — cf_websocket.py::connect_cf_domains (чередование TLS/non-TLS
+// + 429 cooldown + DoH),
 // путь и secure как в оригинале.
 // ---------------------------------------------------------------------------
 
-async fn try_cfproxy_base_domain(
-    dc: i32,
-    base_domain: &str,
-    ws_path: &str,
-) -> (Option<RawWebSocket>, String) {
-    let base_domain = normalize_cf_domain(base_domain);
-    if base_domain.is_empty() {
-        return (None, String::new());
-    }
-    let remaining = cfproxy_429_cooldown_remaining(&base_domain);
-    if remaining > Duration::ZERO {
-        ldebug!(
-            " CF skip {}: 429 cooldown {:.0}s",
-            base_domain,
-            remaining.as_secs_f64().ceil()
-        );
-        return (None, String::new());
-    }
-    let _permit = match acquire_cfproxy_attempt_slot().await {
-        Some(p) => p,
-        None => return (None, String::new()),
-    };
-
-    let domain = format!("kws{}.{}", dc, base_domain);
-    ldebug!(" CF try {}", domain);
-
-    let (ws, resolved_ip, err) = cf_connect_domain(&domain, ws_path, 5.0).await;
-    if let Some(e) = err {
-        // Cooldown ставим ТОЛЬКО при HTTP 429, иначе любой reset/timeout
-        // выжигал бы домены и плодил лавину cooldown.
-        if is_http_status_error(&e, 429) {
-            mark_cfproxy_429_cooldown(&base_domain, &e);
-        }
-        if !resolved_ip.is_empty() {
-            log_cf_conn_error(
-                &format!(" CF fail {} via {}: {}", domain, resolved_ip, e.compact()),
-                &e,
-            );
-        } else {
-            log_cf_conn_error(&format!(" CF fail {}: {}", domain, e.compact()), &e);
-        }
-        return (None, String::new());
-    }
-
-    clear_cfproxy_429_cooldown(&base_domain);
-    if !resolved_ip.is_empty() {
-        ldebug!(" CF ok {} via {}", domain, resolved_ip);
-    } else {
-        ldebug!(" CF ok {} via hostname", domain);
-    }
-    (ws, base_domain)
-}
-
 // Только устанавливает WS-соединение через CF, НЕ трогая conn.
+// Порт cf_websocket.py::connect_cf_domains (L40-103):
+// - чередование TLS/non-TLS по парности числа таймаутов (tls_first),
+// - cooldown 30s на ключ (name, use_tls),
+// - лестница таймаутов CF_CONNECT_TIMEOUTS[timeouts],
+// - retry_single_domain (secure && 1 домен) — повторная попытка со
+//   схемой, противоположной первой.
 async fn cfproxy_acquire_ws(
     dc: i32,
     is_media: bool,
@@ -1279,62 +1324,131 @@ async fn cfproxy_acquire_ws(
     let m_tag = if is_media { " media" } else { "" };
     ldebug!(" CF fallback DC{}{}: {} домен(ов)", dc, m_tag, ordered.len());
 
-    let mut ws: Option<RawWebSocket> = None;
-    let mut chosen_domain = String::new();
+    let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
 
-    if !ordered.is_empty() && !ordered[0].is_empty() {
-        let (w, d) = try_cfproxy_base_domain(dc, &ordered[0], ws_path).await;
-        ws = w;
-        chosen_domain = d;
+    // candidates (name, host) — bridge.py::_cfproxy_fallback.
+    let mut candidates: Vec<(String, String)> = ordered
+        .iter()
+        .filter(|d| !d.is_empty())
+        .map(|base| (base.clone(), format!("kws{}.{}", dc, base)))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let retry_single_domain = secure && candidates.len() == 1;
+    if retry_single_domain {
+        candidates.push(candidates[0].clone());
     }
 
-    if ws.is_none() && ordered.len() > 1 {
-        let remaining_domains: Vec<String> = ordered[1..].to_vec();
-        let sem = Arc::new(tokio::sync::Semaphore::new(CFPROXY_FALLBACK_PARALLEL));
-        let mut handles = Vec::new();
-        for bd in remaining_domains {
-            let sem = sem.clone();
-            let cancel = cancel_token.clone();
-            let ws_path = ws_path.to_string();
-            handles.push(tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancel.cancelled() => None,
-                    r = async {
-                        let _p = sem.acquire().await.ok()?;
-                        let (w, d) = try_cfproxy_base_domain(dc, &bd, &ws_path).await;
-                        w.map(|ws| (ws, d))
-                    } => r,
-                }
-            }));
+    let mut timeouts: usize = 0;
+    let tls_first = cf_prefers_tls();
+    // Python: math.inf — «ключ занят попыткой»; здесь — 1 год вперёд.
+    let inf = std::time::Instant::now() + Duration::from_secs(365 * 24 * 3600);
+
+    for (index, (name, host)) in candidates.iter().enumerate() {
+        if cancel_token.is_cancelled() {
+            return None;
         }
-        for h in handles {
-            if let Ok(Some((w, d))) = h.await {
-                if ws.is_none() {
-                    ws = Some(w);
-                    chosen_domain = d;
-                } else {
-                    tokio::spawn(async move {
-                        w.close().await;
-                    });
+        let mut use_tls = secure && (tls_first != (timeouts % 2 == 1));
+        if retry_single_domain && index == 1 && timeouts == 0 {
+            // Первая попытка была пропущена из-за _cf_timeout_until.
+            use_tls = !tls_first;
+        }
+
+        // Мобильная фича: 429 cooldown — пропускать домен целиком.
+        let remaining = cfproxy_429_cooldown_remaining(name);
+        if remaining > Duration::ZERO {
+            ldebug!(
+                " CF skip {}: 429 cooldown {:.0}s",
+                name,
+                remaining.as_secs_f64().ceil()
+            );
+            continue;
+        }
+
+        let key = (name.clone(), use_tls);
+        let now = std::time::Instant::now();
+        let retry_at = CF_TIMEOUT_UNTIL.read().get(&key).copied();
+        if let Some(t) = retry_at {
+            if now < t {
+                // Python: continue — ключ ещё в cooldown.
+                continue;
+            }
+            // Просрочен: «занято» (Python: math.inf), чтобы другие пути
+            // (H2-пул) видели cooldown, пока идёт попытка.
+            CF_TIMEOUT_UNTIL.write().insert(key.clone(), inf);
+        }
+
+        let attempt_timeout = 10.0_f64
+            .min(CF_CONNECT_TIMEOUTS[timeouts.min(CF_CONNECT_TIMEOUTS.len() - 1)]);
+        ldebug!(" CF try {} tls={}", host, use_tls);
+
+        let (ws, resolved_ip, err) =
+            cf_connect_domain_secured(host, ws_path, attempt_timeout, use_tls).await;
+
+        // Python finally: вернуть исходное значение, если ключ всё ещё «inf».
+        if retry_at.is_some() {
+            let mut m = CF_TIMEOUT_UNTIL.write();
+            if m.get(&key).map(|t| *t >= now + Duration::from_secs(180 * 24 * 3600)).unwrap_or(false)
+            {
+                m.insert(key.clone(), retry_at.unwrap());
+            }
+        }
+
+        if let Some(ws) = ws {
+            CF_TIMEOUT_UNTIL.write().remove(&key);
+            clear_cfproxy_429_cooldown(name);
+            if use_tls {
+                cf_note_tls_success();
+            } else {
+                cf_note_no_tls_success();
+            }
+            // bridge.py::_cfproxy_fallback: переключаем активный CF-домен.
+            if crate::balancer::BALANCER.write().update_domain_for_dc(dc, name) {
+                linfo!(" CF активный домен для DC{} -> {}", dc, name);
+            }
+            if !resolved_ip.is_empty() {
+                ldebug!(" CF ok {} via {}", host, resolved_ip);
+            } else {
+                ldebug!(" CF ok {} via hostname", host);
+            }
+            return Some((ws, name.clone()));
+        }
+
+        if let Some(e) = err {
+            if is_http_status_error(&e, 429) {
+                mark_cfproxy_429_cooldown(name, &e);
+            }
+            if matches!(e, WsError::Timeout) {
+                cf_mark_timeout(name, use_tls);
+                lwarn!(
+                    " CF WebSocket timed out (host={} tls={}); retry in {:.0}s",
+                    host,
+                    use_tls,
+                    CF_TIMEOUT_COOLDOWN.as_secs_f64()
+                );
+                timeouts += 1;
+                if timeouts >= CF_CONNECT_TIMEOUTS.len() {
+                    break;
                 }
+                continue;
+            }
+            if !resolved_ip.is_empty() {
+                log_cf_conn_error(
+                    &format!(" CF fail {} via {}: {}", host, resolved_ip, e.compact()),
+                    &e,
+                );
+            } else {
+                log_cf_conn_error(&format!(" CF fail {}: {}", host, e.compact()), &e);
+            }
+            if retry_single_domain {
+                break;
             }
         }
     }
 
-    match ws {
-        Some(w) => {
-            if !chosen_domain.is_empty() {
-                if crate::balancer::BALANCER.write().update_domain_for_dc(dc, &chosen_domain) {
-                    linfo!(" CF домен для DC{} -> {}", dc, chosen_domain);
-                }
-            }
-            Some((w, chosen_domain))
-        }
-        None => {
-            lwarn!(" CF fallback DC{}{}: все CF домены недоступны", dc, m_tag);
-            None
-        }
-    }
+    lwarn!(" CF fallback DC{}{}: все CF домены недоступны", dc, m_tag);
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,14 +1460,15 @@ async fn cfproxy_acquire_ws(
 
 pub async fn do_fallback<R, W>(
     pools: &ProxyPools,
-    conn_read: R,
-    conn_write: W,
+    mut conn_read: R,
+    mut conn_write: W,
     relay_init: &[u8],
     label: String,
     dc: i32,
     is_test: bool,
     is_media: bool,
     splitter: Option<MsgSplitter>,
+    proto_tag: Option<u32>,
     clt_dec: &TrackedStream,
     clt_enc: &TrackedStream,
     tg_enc: &TrackedStream,
@@ -1444,8 +1559,34 @@ where
         }
     }
 
-    // Шаг 2: cf-ws (без halves).
+    // Шаг 2: cf — сначала H2 media (bridge.py L165-174), затем cf-ws (без halves).
     if use_cf {
+        if CFPROXY_H2_MEDIA.load(Ordering::Relaxed)
+            && !DISABLE_SECURE.load(Ordering::Relaxed)
+            && !FORCE_TEST_DC.load(Ordering::Relaxed)
+            && is_media
+            && proto_tag.is_some()
+            && cf_prefers_tls()
+        {
+            linfo!("[{}] DC{}{} -> trying H2 media", label, dc, m_tag);
+            if let Some(channel) = h2media::h2_pool().open(dc, label.clone()).await {
+                STATS.connections_h2.fetch_add(1, Ordering::Relaxed);
+                STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+                h2media::bridge_h2(
+                    &mut conn_read,
+                    &mut conn_write,
+                    channel,
+                    proto_tag.unwrap(),
+                    label,
+                    clt_dec.clone_state(),
+                    clt_enc.clone_state(),
+                    cancel_token,
+                )
+                .await;
+                return true;
+            }
+        }
+
         if let Some((ws, _chosen_domain)) =
             cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
         {
@@ -1830,6 +1971,7 @@ async fn serve_core<R, W>(
                 is_test_dc,
                 is_media,
                 splitter,
+                Some(proto_int),
                 &clt_decryptor,
                 &clt_encryptor,
                 &tg_encryptor,
@@ -1961,6 +2103,7 @@ async fn serve_core<R, W>(
             is_test_dc,
             is_media,
             splitter_fb,
+            Some(proto_int),
             &clt_decryptor,
             &clt_encryptor,
             &tg_encryptor,
@@ -2020,6 +2163,7 @@ async fn serve_core<R, W>(
                     is_test_dc,
                     is_media,
                     splitter_fb,
+                    Some(proto_int),
                     &clt_decryptor,
                     &clt_encryptor,
                     &tg_encryptor,
@@ -2045,6 +2189,7 @@ async fn serve_core<R, W>(
                         is_test_dc,
                         is_media,
                         splitter_fb,
+                        Some(proto_int),
                         &clt_decryptor,
                         &clt_encryptor,
                         &tg_encryptor,
@@ -2174,12 +2319,21 @@ pub async fn run_proxy(
     let cancel_stats = cancel_root.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut h2_interval = tokio::time::interval(Duration::from_secs(5));
         interval.tick().await;
+        h2_interval.tick().await;
         loop {
             tokio::select! {
                 _ = cancel_stats.cancelled() => return,
+                _ = h2_interval.tick() => {
+                    // tg_ws_proxy.py: каждые 5 секунд log_flow + log_stats.
+                    h2media::h2_pool().log_flow();
+                    h2media::h2_pool().log_stats();
+                }
                 _ = interval.tick() => {
                     linfo!(" {}", STATS.summary_ru());
+                    // Закрываем idle H2-лейны (600с простоя) — экономия батареи.
+                    h2media::h2_pool().close_idle_lanes();
                 }
             }
         }

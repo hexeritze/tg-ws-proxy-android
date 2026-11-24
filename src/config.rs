@@ -71,10 +71,8 @@ pub const CFPROXY_ACTIVE_FILE_NAME: &str = "cfproxy-active-domain.txt";
 pub const CFPROXY_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 pub const CFPROXY_MIN_VALID_DOMAINS: usize = 3;
 pub const CFPROXY_DIAL_PHASE_TIMEOUT: Duration = Duration::from_secs(4);
-pub const CFPROXY_FALLBACK_PARALLEL: usize = 2;
 pub const CFPROXY_429_COOLDOWN: Duration = Duration::from_secs(45);
 pub const CFPROXY_429_MAX_COOLDOWN: Duration = Duration::from_secs(300);
-pub const CFPROXY_GLOBAL_PARALLEL: usize = 4;
 
 pub static RECV_BUF: AtomicI32 = AtomicI32::new(DEFAULT_RECV_BUF as i32);
 pub static SEND_BUF: AtomicI32 = AtomicI32::new(DEFAULT_SEND_BUF as i32);
@@ -100,6 +98,58 @@ impl Default for Cfproxy429State {
 
 // Cloudflare proxy config
 pub static CFPROXY_ENABLED: AtomicBool = AtomicBool::new(true);
+// cf_h2.py: CFPROXY_H2_MEDIA — H2-транспорт для медиа-DC (POST /api).
+// Отключается дополнительно, если DISABLE_SECURE (secure-транспорт не нужен).
+pub static CFPROXY_H2_MEDIA: AtomicBool = AtomicBool::new(true);
+// H2 lane закрывается после 10 минут простоя без каналов — экономия батареи
+// на Android (в оригинальном Python-коде idle timeout отсутствует).
+pub const H2_LANE_IDLE_CLOSE_SECS: f64 = 600.0;
+
+// cf_websocket.py — статистика CF-подключений (tls/no_tls), чередование и
+// timeout cooldown. cf_prefers_tls() управляет выбором H2 vs WS для медиа.
+pub static CF_CON_TLS: AtomicI64 = AtomicI64::new(0);
+pub static CF_CON_NO_TLS: AtomicI64 = AtomicI64::new(0);
+pub const CF_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(30);
+pub const CF_CONNECT_TIMEOUTS: [f64; 5] = [3.0, 3.0, 5.0, 5.0, 10.0];
+pub static CF_TIMEOUT_UNTIL: Lazy<RwLock<HashMap<(String, bool), Instant>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// cf_websocket.py::cf_prefers_tls — tls >= no_tls
+pub fn cf_prefers_tls() -> bool {
+    CF_CON_TLS.load(Ordering::Relaxed) >= CF_CON_NO_TLS.load(Ordering::Relaxed)
+}
+
+/// cf_websocket.py::_cf_timeout_until — проверка cooldown (name, use_tls).
+pub fn cf_timeout_in_cooldown(name: &str, use_tls: bool) -> bool {
+    let now = Instant::now();
+    let map = CF_TIMEOUT_UNTIL.read();
+    map.get(&(name.to_string(), use_tls))
+        .map(|until| now < *until)
+        .unwrap_or(false)
+}
+
+/// cf_websocket.py: при таймауте подключения ставим cooldown 30s и чистим просроченные.
+pub fn cf_mark_timeout(name: &str, use_tls: bool) {
+    let now = Instant::now();
+    let mut map = CF_TIMEOUT_UNTIL.write();
+    map.retain(|_, until| now < *until);
+    map.insert((name.to_string(), use_tls), now + CF_TIMEOUT_COOLDOWN);
+}
+
+/// cf_websocket.py::reset_cf_timeouts
+pub fn reset_cf_timeouts() {
+    CF_CON_TLS.store(0, Ordering::Relaxed);
+    CF_CON_NO_TLS.store(0, Ordering::Relaxed);
+    CF_TIMEOUT_UNTIL.write().clear();
+}
+
+pub fn cf_note_tls_success() {
+    CF_CON_TLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn cf_note_no_tls_success() {
+    CF_CON_NO_TLS.fetch_add(1, Ordering::Relaxed);
+}
 
 pub struct CfproxyConfig {
     pub user_domain: String,
@@ -332,6 +382,11 @@ pub struct Stats {
     pub connections_http_reject: AtomicI64,
     pub connections_passthrough: AtomicI64,
     pub ws_errors: AtomicI64,
+    // cf_h2.py — H2 media stats
+    pub connections_h2: AtomicI64,
+    pub h2_requests: AtomicI64,
+    pub h2_errors: AtomicI64,
+    pub h2_tcp_connections: AtomicI64,
     pub bytes_up: AtomicI64,
     pub bytes_down: AtomicI64,
     pub pool_hits: AtomicI64,
@@ -361,16 +416,18 @@ impl Stats {
             "n/a".to_string()
         };
         format!(
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
+            "total={} active={} ws={} tcp_fb={} cf={} h2={} front={} bad={} masked={} err={} h2err={} pool={} cf_pool={} up={} down={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
             self.connections_tcp_fallback.load(Ordering::Relaxed),
             self.connections_cfproxy.load(Ordering::Relaxed),
+            self.connections_h2.load(Ordering::Relaxed),
             self.connections_fronting.load(Ordering::Relaxed),
             self.connections_bad.load(Ordering::Relaxed),
             self.connections_masked.load(Ordering::Relaxed),
             self.ws_errors.load(Ordering::Relaxed),
+            self.h2_errors.load(Ordering::Relaxed),
             pool_s,
             cf_pool_s,
             human_bytes(self.bytes_up.load(Ordering::Relaxed)),

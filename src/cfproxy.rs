@@ -1,13 +1,11 @@
 use crate::config::*;
-use crate::ws::{is_http_status_error, ws_connect_once, RawWebSocket, WsError};
+use crate::ws::{is_http_status_error, RawWebSocket, WsError};
 use crate::{ldebug, lerror, linfo, lwarn};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 
 use once_cell::sync::Lazy;
-static CFPROXY_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(CFPROXY_GLOBAL_PARALLEL));
 
 // ---------------------------------------------------------------------------
 // Domain decoding
@@ -195,10 +193,6 @@ pub fn cfproxy_429_cooldown_remaining(domain: &str) -> Duration {
         return Duration::ZERO;
     }
     until - now
-}
-
-pub async fn acquire_cfproxy_attempt_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
-    CFPROXY_SEM.acquire().await.ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +574,20 @@ pub async fn cf_connect_domain(
     path: &str,
     timeout: f64,
 ) -> (Option<RawWebSocket>, String, Option<WsError>) {
+    let secure = !crate::config::DISABLE_SECURE.load(std::sync::atomic::Ordering::Relaxed);
+    cf_connect_domain_secured(domain, path, timeout, secure).await
+}
+
+/// cf_websocket.py::connect_cf_domains передаёт `use_tls` явно (чередование
+/// TLS/non-TLS), поэтому нужна версия с явным secure-флагом.
+pub async fn cf_connect_domain_secured(
+    domain: &str,
+    path: &str,
+    timeout: f64,
+    secure: bool,
+) -> (Option<RawWebSocket>, String, Option<WsError>) {
+    use crate::ws::ws_connect_once_full;
+
     let path = if path.is_empty() { "/apiws" } else { path };
 
     let attempt_timeout = crate::ws::ws_connect_timeout(timeout);
@@ -589,7 +597,7 @@ pub async fn cf_connect_domain(
     }
 
     let host_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-    match ws_connect_once(domain, domain, path, host_timeout).await {
+    match ws_connect_once_full(domain, domain, path, host_timeout, None, secure).await {
         Ok(ws) => return (Some(ws), String::new(), None),
         Err(host_err) => {
             if is_http_status_error(&host_err, 429) {
@@ -602,7 +610,7 @@ pub async fn cf_connect_domain(
             }
             ldebug!(" CF DNS {} -> {}", domain, resolved_ip);
             let ip_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-            match ws_connect_once(&resolved_ip, domain, path, ip_timeout).await {
+            match ws_connect_once_full(&resolved_ip, domain, path, ip_timeout, None, secure).await {
                 Ok(ws) => (Some(ws), resolved_ip, None),
                 Err(e) => (None, resolved_ip, Some(e)),
             }

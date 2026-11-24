@@ -46,3 +46,5 @@
 -keepclasseswithmembernames class * {
     native <methods>;
 }
+
+-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }

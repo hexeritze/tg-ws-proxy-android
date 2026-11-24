@@ -1,8 +1,51 @@
 import java.util.Properties
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.ValueSource
+import org.gradle.api.provider.ValueSourceParameters
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+abstract class RustlsAndroidVersion :
+    ValueSource<String, RustlsAndroidVersion.Parameters> {
+
+    interface Parameters : ValueSourceParameters {
+        val lockFile: RegularFileProperty
+    }
+
+    override fun obtain(): String {
+        val lines = parameters.lockFile.get().asFile.readLines()
+        val name = """name = "rustls-platform-verifier-android""""
+
+        val index = lines.indexOfFirst { it.trim() == name }
+        check(index >= 0) {
+            "rustls-platform-verifier-android not found in Cargo.lock"
+        }
+
+        return lines.drop(index + 1)
+            .first { it.trimStart().startsWith("version = ") }
+            .substringAfter('"')
+            .substringBefore('"')
+    }
+}
+
+val rustlsAndroidVersion = providers.of(RustlsAndroidVersion::class.java) {
+    parameters.lockFile.set(
+        rootProject.layout.projectDirectory.file("Cargo.lock")
+    )
+}
+
+configurations.configureEach {
+    resolutionStrategy.eachDependency {
+        if (
+            requested.group == "org.rustls" &&
+            requested.name == "rustls-platform-verifier"
+        ) {
+            useVersion(rustlsAndroidVersion.get())
+        }
+    }
 }
 
 android {
@@ -145,4 +188,6 @@ dependencies {
     debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.appcompat:appcompat:1.6.1")
+
+    implementation("org.rustls:rustls-platform-verifier")
 }

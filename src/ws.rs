@@ -86,8 +86,21 @@ impl ServerCertVerifier for NoVerify {
 
 use once_cell::sync::Lazy;
 
-// Глобальный TLS-конфиг с session resumption cache (аналог tls.NewLRUClientSessionCache(100))
+// Глобальный TLS-конфиг: верификация сертификатов по Mozilla roots
+// (webpki-roots — аналог certifi из Python-оригинала) + session resumption cache.
 static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
+    Arc::new(cfg)
+});
+
+// Отдельный контекст для fronting (check_hostname=False в оригинале):
+// fronting-домен отдаёт чужой сертификат, поэтому верификация отключена.
+static TLS_CONFIG_FRONTING: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
     let mut cfg = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
@@ -96,9 +109,17 @@ static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
     Arc::new(cfg)
 });
 
-// Отдельный контекст для fronting (check_hostname=False в оригинале).
-// На практике оба контекста NoVerify; разделение сохранено для паритета.
-static TLS_CONFIG_FRONTING: Lazy<Arc<ClientConfig>> = Lazy::new(|| TLS_CONFIG.clone());
+// HTTP/2-транспорт для медиа-трафика (порт cf_h2.py): верифицируемый TLS + ALPN h2.
+pub static TLS_CONFIG_H2: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
+    Arc::new(cfg)
+});
 
 // ---------------------------------------------------------------------------
 // WsHandshakeError
@@ -834,6 +855,37 @@ pub async fn ws_connect_once_full(
 
     let (read_half, write_half) = tokio::io::split(tls_conn);
     handshake_tls(read_half, write_half, domain, path, timeout).await
+}
+
+// TLS-подключение с ALPN h2 для HTTP/2-транспорта медиа-трафика (cf_h2.py).
+// Возвращает готовый TlsStream; h2media завершает HTTP/2-preface поверх него.
+pub async fn tls_h2_connect(
+    dial_addr: &str,
+    domain: &str,
+    timeout: Duration,
+) -> Result<TlsStream<TcpStream>, WsError> {
+    let target_addr = format!("{}:443", dial_addr);
+    let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(WsError::Io(e)),
+        Err(_) => return Err(WsError::Timeout),
+    };
+    set_sock_opts(&raw_conn);
+
+    let connector = TlsConnector::from(TLS_CONFIG_H2.clone());
+    let sni_server = server_name(domain);
+    let handshake_timeout = ws_handshake_timeout(timeout);
+    match tokio::time::timeout(handshake_timeout, connector.connect(sni_server, raw_conn)).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(e)) => {
+            ldebug!(" h2 tls fail {} via {}: {}", domain, dial_addr, e);
+            Err(WsError::Io(e))
+        }
+        Err(_) => {
+            ldebug!(" h2 tls fail {} via {}: timeout", domain, dial_addr);
+            Err(WsError::Timeout)
+        }
+    }
 }
 
 // wsConnect: пытается ip, при необходимости резолвит DoH

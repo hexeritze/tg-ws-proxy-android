@@ -2,6 +2,7 @@ pub mod cfproxy;
 pub mod config;
 pub mod crypto;
 pub mod faketls;
+pub mod h2media;
 pub mod proxy;
 pub mod ws;
 pub mod balancer;
@@ -81,6 +82,9 @@ pub unsafe extern "C" fn StartProxy(
 
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
+    // bridge.py L29-33: сброс cooldown'ов при старте.
+    reset_cf_timeouts();
+    proxy::reset_tcp_backoff();
 
     if secret_str.len() == 32 {
         if hex::decode(&secret_str).is_ok() {
@@ -167,6 +171,8 @@ pub extern "C" fn StopProxy() -> c_int {
         linfo!("StopProxy: closing pool connections");
         pools.close_all().await;
         pools.reset().await;
+        // tg_ws_proxy.py: close() пула H2 при остановке.
+        h2media::close_h2_pool().await;
         linfo!("StopProxy: done");
     });
 
@@ -175,6 +181,8 @@ pub extern "C" fn StopProxy() -> c_int {
     DC_FAIL_UNTIL.write().clear();
     IP_FAIL_UNTIL.write().clear();
     cfproxy::clear_cfproxy_429_cooldowns();
+    reset_cf_timeouts();
+    proxy::reset_tcp_backoff();
     proxy::set_ws_pool_fronting_first(true);
 
     linfo!("StopProxy: exit");
