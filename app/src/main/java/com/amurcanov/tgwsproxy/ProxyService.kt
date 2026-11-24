@@ -27,6 +27,7 @@ class ProxyService : Service() {
     private var starting = false
     private var stopping = false
     private var lastStart: Intent? = null
+    private val runPreferences by lazy { getSharedPreferences("proxy_runtime", MODE_PRIVATE) }
     private var lastNotificationContent = ""
     private var lastNotificationAtMs = 0L
     private var notificationStartedAtMs = 0L
@@ -86,45 +87,59 @@ class ProxyService : Service() {
         when (intent?.action) {
             ACTION_START -> startProxy(intent)
             ACTION_STOP -> stopProxy()
-            ACTION_RESTART -> startProxy(lastStart ?: intent, restart = true)
-            null -> stopSelf()
+            ACTION_RESTART -> startProxy(lastStart ?: intent.takeIf { it.hasExtra(EXTRA_PORT) }, restart = true)
+            null -> {
+                if (runPreferences.getBoolean("running_requested", false)) startProxy(null)
+                else stopSelf(startId)
+            }
+            else -> {
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
         }
-        return if (intent?.action == ACTION_STOP) START_NOT_STICKY else START_REDELIVER_INTENT
+        return if (stopping || (intent == null && !starting && !_isRunning.value)) START_NOT_STICKY else START_STICKY
     }
 
-    private fun startProxy(intent: Intent, restart: Boolean = false) {
+    private fun startProxy(intent: Intent?, restart: Boolean = false) {
         if (stopping || (!restart && (starting || _isRunning.value))) return
         starting = true
         operation?.cancel()
         statsJob?.cancel()
-        lastStart = Intent(intent).setAction(ACTION_START)
         notificationStartedAtMs = System.currentTimeMillis()
         val notification = createNotification(getString(R.string.notification_starting))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else { startForeground(NOTIFICATION_ID, notification) }
+        // Commit the requested state before a process death can interrupt startup.
+        runPreferences.edit().putBoolean("running_requested", true).commit()
         val nativeCacheDir = cacheDir.absolutePath
         operation = serviceScope.launch {
             try {
+                val configuration = intent ?: ProxyController.createStartIntent(applicationContext)
+                if (configuration == null) {
+                    stopProxy()
+                    return@launch
+                }
+                lastStart = Intent(configuration).setAction(ACTION_START)
                 val result = withContext(Dispatchers.IO) {
                     nativeMutex.withLock {
                         if (nativeOwner != 0L) NativeProxy.stopProxy()
                         nativeOwner = owner
-                        NativeProxy.setPoolSize(intent.getIntExtra(EXTRA_POOL_SIZE, 4))
-                        NativeProxy.setBufferSizeKb(intent.getIntExtra(EXTRA_BUFFER_KB, 256))
+                        NativeProxy.setPoolSize(configuration.getIntExtra(EXTRA_POOL_SIZE, 4))
+                        NativeProxy.setBufferSizeKb(configuration.getIntExtra(EXTRA_BUFFER_KB, 256))
                         NativeProxy.setCfProxyCacheDir(nativeCacheDir)
-                        NativeProxy.setCfProxyConfig(intent.getBooleanExtra(EXTRA_CFPROXY_ENABLED, true), true,
-                            intent.getStringExtra(EXTRA_CFPROXY_DOMAIN).orEmpty())
-                        NativeProxy.setCfH2Media(intent.getBooleanExtra(EXTRA_H2, true))
-                        NativeProxy.setCfWorkerDomains(intent.getStringExtra(EXTRA_WORKERS).orEmpty())
-                        NativeProxy.setDisableSecure(intent.getBooleanExtra(EXTRA_NO_SECURE, false))
-                        NativeProxy.setForceTestDc(intent.getBooleanExtra(EXTRA_TEST_DC, false))
-                        NativeProxy.setFakeTlsDomain(intent.getStringExtra(EXTRA_FAKE_TLS).orEmpty())
-                        NativeProxy.setProxyProtocol(intent.getBooleanExtra(EXTRA_PROXY_PROTOCOL, false))
-                        NativeProxy.startProxy(intent.getStringExtra(EXTRA_BIND_IP) ?: "127.0.0.1",
-                            intent.getIntExtra(EXTRA_PORT, 1443), intent.getStringExtra(EXTRA_IPS).orEmpty(),
-                            intent.getStringExtra(EXTRA_SECRET_KEY).orEmpty(),
-                            if (intent.getBooleanExtra(EXTRA_VERBOSE, false)) 1 else 0)
+                        NativeProxy.setCfProxyConfig(configuration.getBooleanExtra(EXTRA_CFPROXY_ENABLED, true), true,
+                            configuration.getStringExtra(EXTRA_CFPROXY_DOMAIN).orEmpty())
+                        NativeProxy.setCfH2Media(configuration.getBooleanExtra(EXTRA_H2, true))
+                        NativeProxy.setCfWorkerDomains(configuration.getStringExtra(EXTRA_WORKERS).orEmpty())
+                        NativeProxy.setDisableSecure(configuration.getBooleanExtra(EXTRA_NO_SECURE, false))
+                        NativeProxy.setForceTestDc(configuration.getBooleanExtra(EXTRA_TEST_DC, false))
+                        NativeProxy.setFakeTlsDomain(configuration.getStringExtra(EXTRA_FAKE_TLS).orEmpty())
+                        NativeProxy.setProxyProtocol(configuration.getBooleanExtra(EXTRA_PROXY_PROTOCOL, false))
+                        NativeProxy.startProxy(configuration.getStringExtra(EXTRA_BIND_IP) ?: "127.0.0.1",
+                            configuration.getIntExtra(EXTRA_PORT, 1443), configuration.getStringExtra(EXTRA_IPS).orEmpty(),
+                            configuration.getStringExtra(EXTRA_SECRET_KEY).orEmpty(),
+                            if (configuration.getBooleanExtra(EXTRA_VERBOSE, false)) 1 else 0)
                     }
                 }
                 starting = false
@@ -151,17 +166,24 @@ class ProxyService : Service() {
             var interval = 15_000L
             while (isActive) {
                 delay(interval)
-                val raw = withContext(Dispatchers.IO) { NativeProxy.getStats() } ?: continue
-                val active = extractStat(raw, "active=").toIntOrNull() ?: 0
-                val bytes = parseHumanBytes(extractStat(raw, "up=")) + parseHumanBytes(extractStat(raw, "down="))
-                updateNotification(getString(R.string.notification_traffic, formatBytes(bytes), active))
-                interval = if (active == 0) 60_000L else 15_000L
+                try {
+                    val raw = withContext(Dispatchers.IO) { NativeProxy.getStats() } ?: continue
+                    val active = extractStat(raw, "active=").toIntOrNull() ?: 0
+                    val bytes = parseHumanBytes(extractStat(raw, "up=")) + parseHumanBytes(extractStat(raw, "down="))
+                    updateNotification(getString(R.string.notification_traffic, formatBytes(bytes), active))
+                    interval = if (active == 0) 60_000L else 15_000L
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    Log.w(TAG, "Unable to update proxy statistics", error)
+                }
             }
         }
     }
 
     private fun stopProxy() {
         if (stopping) return
+        runPreferences.edit().putBoolean("running_requested", false).commit()
         stopping = true
         starting = false
         operation?.cancel()
@@ -169,11 +191,18 @@ class ProxyService : Service() {
         statsJob = null
         operation = serviceScope.launch {
             updateNotification(getString(R.string.notification_stopping), force = true)
-            withContext(Dispatchers.IO) { stopNative(owner) }
-            updateRunningState(false)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
-            else { @Suppress("DEPRECATION") stopForeground(true) }
-            stopSelf()
+            try {
+                withContext(Dispatchers.IO) { stopNative(owner) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Log.e(TAG, "Unable to stop native proxy", error)
+            } finally {
+                updateRunningState(false)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
+                else { @Suppress("DEPRECATION") stopForeground(true) }
+                stopSelf()
+            }
         }
     }
 
@@ -182,8 +211,12 @@ class ProxyService : Service() {
         if (!force && (lastNotificationContent == content || now - lastNotificationAtMs < 15_000L)) return
         lastNotificationContent = content
         lastNotificationAtMs = now
-        val manager = getSystemService(NOTIFICATION_SERVICE) as? NotificationManager
-        manager?.notify(NOTIFICATION_ID, createNotification(content))
+        try {
+            val manager = getSystemService(NOTIFICATION_SERVICE) as? NotificationManager
+            manager?.notify(NOTIFICATION_ID, createNotification(content))
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "Unable to update proxy notification", error)
+        }
     }
 
     private fun updateRunningState(running: Boolean) {

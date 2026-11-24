@@ -60,6 +60,7 @@ import com.amurcanov.tgwsproxy.ui.LogsTab
 import com.amurcanov.tgwsproxy.ui.SettingsTab
 import com.amurcanov.tgwsproxy.ui.TgWsProxyTheme
 import com.amurcanov.tgwsproxy.ui.openUrlInBrowser
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -74,7 +75,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.abs
@@ -595,25 +596,33 @@ object LogManager {
     private val emojiRegex = Regex("[\\x{1F300}-\\x{1F5FF}\\x{1F900}-\\x{1F9FF}\\x{1F600}-\\x{1F64F}\\x{1F680}-\\x{1F6FF}\\x{2600}-\\x{26FF}\\x{2700}-\\x{27BF}\\x{1F1E6}-\\x{1F1FF}\\x{1F191}-\\x{1F251}\\x{1F004}\\x{1F0CF}\\x{1F170}-\\x{1F171}\\x{1F17E}-\\x{1F17F}\\x{1F18E}\\x{3030}\\x{2B50}\\x{2B55}\\x{2934}-\\x{2935}\\x{2B05}-\\x{2B07}\\x{2B1B}-\\x{2B1C}\\x{3297}\\x{3299}\\x{303D}\\x{00A9}\\x{00AE}\\x{2122}\\x{23F3}\\x{24C2}\\x{23E9}-\\x{23EF}\\x{25B6}\\x{23F8}-\\x{23FA}⚠✅❌⚡🔥🔄🔗]")
 
     @Synchronized
-    fun startListening() {
+    internal fun startListening(createProcess: () -> Process = {
+        ProcessBuilder("logcat", "-v", "tag", "--pid", android.os.Process.myPid().toString())
+            .redirectErrorStream(true).start()
+    }) {
         if (job?.isActive == true) return
         job = CoroutineScope(Dispatchers.IO).launch {
-            val process = ProcessBuilder("logcat", "-v", "tag", "--pid", android.os.Process.myPid().toString())
-                .redirectErrorStream(true).start()
+            var process: Process? = null
             try {
+                val sessionProcess = createProcess()
+                process = sessionProcess
                 synchronized(this@LogManager) {
-                    if (!isActive) { process.destroy(); return@launch }
-                    logcatProcess = process
+                    if (!isActive) return@launch
+                    logcatProcess = sessionProcess
                 }
                 val channel = Channel<LogEntry>(128, onBufferOverflow = BufferOverflow.DROP_OLDEST)
                 launch {
                     try {
-                        process.inputStream.bufferedReader().use { reader ->
+                        sessionProcess.inputStream.bufferedReader().use { reader ->
                             while (isActive) {
                                 val line = reader.readLine() ?: break
                                 parseLine(line)?.let { channel.trySend(it) }
                             }
                         }
+                    } catch (error: IOException) {
+                        // Closing logcat while readLine is blocked can throw even
+                        // after coroutine cancellation. It must end only this reader.
+                        if (isActive) Log.w("LogManager", "Logcat stream ended", error)
                     } finally { channel.close() }
                 }
                 for (first in channel) {
@@ -624,13 +633,22 @@ object LogManager {
                     logs.value = applyBatch(logs.value, batch)
                     delay(150)
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w("LogManager", "Unable to collect logs", error)
             } finally {
-                process.destroy()
+                destroyProcess(process)
                 synchronized(this@LogManager) {
                     if (logcatProcess === process) logcatProcess = null
                 }
             }
         }
+    }
+
+    private fun destroyProcess(process: Process?) {
+        try { process?.destroy() }
+        catch (error: Exception) { Log.w("LogManager", "Unable to close logcat", error) }
     }
 
     /**
@@ -664,7 +682,7 @@ object LogManager {
     fun stopListening() {
         job?.cancel()
         job = null
-        logcatProcess?.destroy()
+        destroyProcess(logcatProcess)
         logcatProcess = null
     }
 

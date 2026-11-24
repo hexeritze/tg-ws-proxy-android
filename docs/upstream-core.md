@@ -6,7 +6,7 @@ The core supports direct WS pools, CF Worker → CF media H2 → CF WS → TCP f
 
 H2 uses one shared client per DC/domain, bounded requests and response memory, exact-ciphertext recovery, capacity rotation, transport error delivery, and a timed preflight before consuming native packets. Plaintext authentication packets stay outside replay history. FakeTLS mirrors cipher suites and X25519/hybrid key shares, profiles the masking site's first encrypted record, and rejects ClientHello replay across proxy restarts.
 
-For Android power usage, idle WS and Worker preconnections expire after two minutes or less. A new request replenishes them. H2 recovery checks run once per second while recovery work exists. The foreground service uses 15-second traffic updates and 60-second idle updates. Native tasks and runtime threads end on stop. Logcat collection follows the visible activity lifecycle. The service uses Android's normal power management.
+For Android power usage, idle WS and Worker preconnections expire after two minutes or less. A new request replenishes them. H2 recovery checks run once per second while recovery work exists. The foreground service uses 15-second traffic updates and 60-second idle updates. Native tasks and runtime threads end on stop. Logcat collection follows the visible activity lifecycle and handles reader shutdown failures. The foreground service persists the requested running state and restores saved settings on a sticky restart. The service uses Android's normal power management.
 
 ## Build and check
 
@@ -14,12 +14,14 @@ Install JDK 21, Android SDK 35, NDK `28.2.13676358`, Rust, and the `aarch64-linu
 
 The Gradle `preBuild` task builds the Rust libraries with `Cargo.lock` and packages them from `app/build/generated/rustJniLibs`. The committed legacy `.so` files are superseded by these generated outputs.
 
-On Windows run `gradlew.bat :app:assembleUniversalDebug :app:lintUniversalDebug`. On Linux/macOS, the included wrapper can be invoked directly:
+On Windows run `gradlew.bat :app:assembleUniversalDebug :app:testUniversalDebugUnitTest :app:lintUniversalDebug`. On Linux/macOS, the included wrapper can be invoked directly:
 
 ```sh
-java -classpath gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain :app:assembleUniversalDebug :app:lintUniversalDebug
+java -classpath gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain :app:assembleUniversalDebug :app:testUniversalDebugUnitTest :app:lintUniversalDebug
 cargo test --locked
 ```
+
+The Android unit tests use Robolectric and build a host Rust library through `buildRustHostForTests` to verify service lifecycle transitions with a real native listener.
 
 The universal APK is written to `app/build/outputs/apk/universal/debug/app-universal-debug.apk`. ARM32 and ARM64 flavors remain available.
 

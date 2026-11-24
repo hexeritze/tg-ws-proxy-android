@@ -13,8 +13,8 @@ android {
     defaultConfig {
         applicationId = "com.amurcanov.tgwsproxy"
         targetSdk = 35
-        versionCode = 123
-        versionName = "1.2.3"
+        versionCode = 124
+        versionName = "1.2.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -110,6 +110,7 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+    testOptions { unitTests.isIncludeAndroidResources = true }
     buildFeatures {
         compose = true
         buildConfig = true
@@ -144,6 +145,9 @@ dependencies {
     // JNA for easy C-shared library calls
     implementation("net.java.dev.jna:jna:5.14.0@aar")
     debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
+    testImplementation("junit:junit:4.13.2")
+    testRuntimeOnly("net.java.dev.jna:jna:5.14.0")
+    testImplementation("org.robolectric:robolectric:4.16.1")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.appcompat:appcompat:1.6.1")
 }
@@ -197,3 +201,21 @@ val syncRustLibraries = tasks.register<Sync>("syncRustLibraries") {
     into(nativeOutput)
 }
 tasks.named("preBuild") { dependsOn(syncRustLibraries) }
+
+val hostLibraryName = when {
+    hostSystem.contains("windows") -> "tgwsproxy.dll"
+    hostSystem.contains("mac") -> "libtgwsproxy.dylib"
+    else -> "libtgwsproxy.so"
+}
+val buildRustHostForTests = tasks.register<Exec>("buildRustHostForTests") {
+    workingDir(rootProject.layout.projectDirectory)
+    inputs.files(rootProject.fileTree("src") { include("**/*.rs") })
+    inputs.files(rootProject.file("Cargo.toml"), rootProject.file("Cargo.lock"))
+    outputs.file(cargoOutput.file("debug/$hostLibraryName"))
+    environment("CARGO_TARGET_DIR", cargoOutput.asFile.absolutePath)
+    commandLine("cargo", "build", "--locked", "--jobs", "4")
+}
+tasks.withType<Test>().configureEach {
+    dependsOn(buildRustHostForTests)
+    systemProperty("jna.library.path", rootProject.layout.projectDirectory.dir("target/debug").asFile.absolutePath)
+}

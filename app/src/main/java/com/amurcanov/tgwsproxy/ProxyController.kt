@@ -3,6 +3,7 @@ package com.amurcanov.tgwsproxy
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
+import android.util.Log
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.first
 
@@ -12,6 +13,21 @@ object ProxyController {
         context: Context,
         showInvalidPortToast: Boolean = false
     ): Boolean {
+        val intent = createStartIntent(context, showInvalidPortToast) ?: return false
+        return try {
+            ContextCompat.startForegroundService(context, intent)
+            ProxyTileSync.requestSync(context)
+            true
+        } catch (error: RuntimeException) {
+            Log.e("ProxyController", "Unable to start foreground proxy", error)
+            false
+        }
+    }
+
+    internal suspend fun createStartIntent(
+        context: Context,
+        showInvalidPortToast: Boolean = false
+    ): Intent? {
         val settingsStore = SettingsStore(context)
         settingsStore.migrateLegacyDefaults()
         val portText = settingsStore.port.first()
@@ -21,7 +37,7 @@ object ProxyController {
                 Toast.makeText(context, context.getString(R.string.invalid_port), Toast.LENGTH_SHORT).show()
             }
             ProxyTileSync.requestSync(context)
-            return false
+            return null
         }
 
         val bindIp = settingsStore.bindIp.first()
@@ -55,33 +71,28 @@ object ProxyController {
             }
         }.joinToString(",")
 
-        ContextCompat.startForegroundService(
-            context,
-            Intent(context, ProxyService::class.java).apply {
-                action = ProxyService.ACTION_START
-                putExtra(ProxyService.EXTRA_BIND_IP, bindIp)
-                putExtra(ProxyService.EXTRA_PORT, port)
-                putExtra(ProxyService.EXTRA_IPS, parsedIps)
-                putExtra(ProxyService.EXTRA_POOL_SIZE, poolSize)
-                putExtra(ProxyService.EXTRA_CFPROXY_ENABLED, cfEnabled)
-                putExtra(ProxyService.EXTRA_CFPROXY_PRIORITY, true)
-                putExtra(
-                    ProxyService.EXTRA_CFPROXY_DOMAIN,
-                    if (customCfDomainEnabled && cfEnabled) customCfDomain else ""
-                )
-                putExtra(ProxyService.EXTRA_SECRET_KEY, secretKey)
-                putExtra(ProxyService.EXTRA_H2, options.h2)
-                putExtra(ProxyService.EXTRA_WORKERS, options.workers)
-                putExtra(ProxyService.EXTRA_NO_SECURE, options.noSecure)
-                putExtra(ProxyService.EXTRA_TEST_DC, options.testDc)
-                putExtra(ProxyService.EXTRA_FAKE_TLS, options.fakeTlsDomain.trim())
-                putExtra(ProxyService.EXTRA_PROXY_PROTOCOL, options.proxyProtocol)
-                putExtra(ProxyService.EXTRA_BUFFER_KB, options.bufferKb)
-                putExtra(ProxyService.EXTRA_VERBOSE, verbose)
-            }
-        )
-        ProxyTileSync.requestSync(context)
-        return true
+        return Intent(context, ProxyService::class.java).apply {
+            action = ProxyService.ACTION_START
+            putExtra(ProxyService.EXTRA_BIND_IP, bindIp)
+            putExtra(ProxyService.EXTRA_PORT, port)
+            putExtra(ProxyService.EXTRA_IPS, parsedIps)
+            putExtra(ProxyService.EXTRA_POOL_SIZE, poolSize)
+            putExtra(ProxyService.EXTRA_CFPROXY_ENABLED, cfEnabled)
+            putExtra(ProxyService.EXTRA_CFPROXY_PRIORITY, true)
+            putExtra(
+                ProxyService.EXTRA_CFPROXY_DOMAIN,
+                if (customCfDomainEnabled && cfEnabled) customCfDomain else ""
+            )
+            putExtra(ProxyService.EXTRA_SECRET_KEY, secretKey)
+            putExtra(ProxyService.EXTRA_H2, options.h2)
+            putExtra(ProxyService.EXTRA_WORKERS, options.workers)
+            putExtra(ProxyService.EXTRA_NO_SECURE, options.noSecure)
+            putExtra(ProxyService.EXTRA_TEST_DC, options.testDc)
+            putExtra(ProxyService.EXTRA_FAKE_TLS, options.fakeTlsDomain.trim())
+            putExtra(ProxyService.EXTRA_PROXY_PROTOCOL, options.proxyProtocol)
+            putExtra(ProxyService.EXTRA_BUFFER_KB, options.bufferKb)
+            putExtra(ProxyService.EXTRA_VERBOSE, verbose)
+        }
     }
 
     fun stop(context: Context) {
