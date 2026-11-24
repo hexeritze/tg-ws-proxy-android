@@ -1,6 +1,6 @@
 use crate::config::*;
 use crate::crypto::xor_mask_in_place;
-use crate::{ldebug};
+use crate::ldebug;
 use base64::Engine;
 use byteorder::{BigEndian, ByteOrder};
 use rand::RngCore;
@@ -32,73 +32,79 @@ pub const MAX_MESSAGE_LEN: u64 = 16 * 1024 * 1024;
 const MAX_FRAME_PAYLOAD: u64 = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// TLS config: InsecureSkipVerify + session cache (как в Go)
+// TLS verification and session resumption shared by direct and CF connections.
+// Domain fronting validates the certificate chain and handshake signatures,
+// matching upstream's check_hostname=False mode.
 // ---------------------------------------------------------------------------
 
+use once_cell::sync::Lazy;
+static TLS_ROOTS: Lazy<Arc<rustls::RootCertStore>> = Lazy::new(|| {
+    Arc::new(rustls::RootCertStore::from_iter(
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+    ))
+});
+static TLS_VERIFIER: Lazy<Arc<rustls::client::WebPkiServerVerifier>> = Lazy::new(|| {
+    rustls::client::WebPkiServerVerifier::builder(TLS_ROOTS.clone())
+        .build()
+        .expect("TLS roots")
+});
 #[derive(Debug)]
-struct NoVerify;
-
-impl ServerCertVerifier for NoVerify {
+struct FrontingVerifier;
+impl ServerCertVerifier for FrontingVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        certificate: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _name: &ServerName<'_>,
+        _ocsp: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        let certificate = rustls::server::ParsedCertificate::try_from(certificate)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &certificate,
+            &TLS_ROOTS,
+            intermediates,
+            now,
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .all,
+        )?;
         Ok(ServerCertVerified::assertion())
     }
-
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        TLS_VERIFIER.verify_tls12_signature(message, certificate, signature)
     }
-
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        TLS_VERIFIER.verify_tls13_signature(message, certificate, signature)
     }
-
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-        ]
+        TLS_VERIFIER.supported_verify_schemes()
     }
 }
-
-use once_cell::sync::Lazy;
-
-// Глобальный TLS-конфиг с session resumption cache (аналог tls.NewLRUClientSessionCache(100))
 static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
-    let mut cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
+    let mut config = ClientConfig::builder()
+        .with_root_certificates((*TLS_ROOTS).as_ref().clone())
         .with_no_client_auth();
-    cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
-    Arc::new(cfg)
+    config.resumption = rustls::client::Resumption::in_memory_sessions(100);
+    Arc::new(config)
 });
-
-// Отдельный контекст для fronting (check_hostname=False в оригинале).
-// На практике оба контекста NoVerify; разделение сохранено для паритета.
-static TLS_CONFIG_FRONTING: Lazy<Arc<ClientConfig>> = Lazy::new(|| TLS_CONFIG.clone());
+static TLS_CONFIG_FRONTING: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+    let mut config = (**TLS_CONFIG).clone();
+    config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(FrontingVerifier));
+    Arc::new(config)
+});
 
 // ---------------------------------------------------------------------------
 // WsHandshakeError
@@ -220,7 +226,8 @@ impl RawWebSocket {
         let mut writer = self.writer.lock().await;
         for part in parts {
             let frame = build_frame(OP_BINARY, part, true);
-            let res = tokio::time::timeout(WS_WRITE_TIMEOUT, write_all_match(&mut writer, &frame)).await;
+            let res =
+                tokio::time::timeout(WS_WRITE_TIMEOUT, write_all_match(&mut writer, &frame)).await;
             match res {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -284,7 +291,11 @@ impl RawWebSocket {
                 OP_CLOSE => {
                     self.closed.store(true, Ordering::Relaxed);
                     let (code, reason) = parse_close(&payload);
-                    ldebug!("WS OP_CLOSE from upstream: code={:?} reason={:?}", code, reason);
+                    ldebug!(
+                        "WS OP_CLOSE from upstream: code={:?} reason={:?}",
+                        code,
+                        reason
+                    );
                     let mut close_payload = payload;
                     if close_payload.len() > 2 {
                         close_payload.truncate(2);
@@ -333,8 +344,11 @@ impl RawWebSocket {
         // Best-effort close frame + shutdown транспорта.
         let frame = build_frame(OP_CLOSE, &[], true);
         let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
-        let mut writer = self.writer.lock().await;
-        let _ = shutdown_match(&mut writer).await;
+        let _ = tokio::time::timeout(WS_CONTROL_TIMEOUT, async {
+            let mut writer = self.writer.lock().await;
+            let _ = shutdown_match(&mut writer).await;
+        })
+        .await;
     }
 
     // recv с дедлайном чтения (для bridge).
@@ -577,7 +591,7 @@ fn set_sock_opts(stream: &TcpStream) {
     }
     // Аналог Go/Python: keepalive 30s — детект мёртвых соединений на мобиле.
     let sock = socket2::SockRef::from(stream);
-    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(120));
     let _ = sock.set_tcp_keepalive(&ka);
     // proxy/raw_websocket.py::set_sock_opts — buffer_size из конфига.
     let buf = BUFFER_SIZE.load(std::sync::atomic::Ordering::Relaxed);
@@ -632,8 +646,7 @@ async fn handshake_tls(
         Err(_) => return Err(WsError::Timeout),
     }
     let mut bufreader = BufReader::with_capacity(4096, read_half);
-    let (status_code, first_line, headers) =
-        read_http_response(&mut bufreader, timeout).await?;
+    let (status_code, first_line, headers) = read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
         return Ok(RawWebSocket {
             reader: tokio::sync::Mutex::new(WsReader::Tls(bufreader)),
@@ -672,8 +685,7 @@ async fn handshake_plain(
         Err(_) => return Err(WsError::Timeout),
     }
     let mut bufreader = BufReader::with_capacity(4096, read_half);
-    let (status_code, first_line, headers) =
-        read_http_response(&mut bufreader, timeout).await?;
+    let (status_code, first_line, headers) = read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
         return Ok(RawWebSocket {
             reader: tokio::sync::Mutex::new(WsReader::Plain(bufreader)),
@@ -817,20 +829,24 @@ pub async fn ws_connect_once_full(
     let sni_server = server_name(sni_name);
 
     let handshake_timeout = ws_handshake_timeout(timeout);
-    let tls_conn =
-        match tokio::time::timeout(handshake_timeout, connector.connect(sni_server, raw_conn)).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                if e.kind() != std::io::ErrorKind::ConnectionReset {
-                    ldebug!(" ws tls fail {} via {}: {}", domain, dial_addr, e);
-                }
-                return Err(WsError::Io(e));
+    let tls_conn = match tokio::time::timeout(
+        handshake_timeout,
+        connector.connect(sni_server, raw_conn),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            if e.kind() != std::io::ErrorKind::ConnectionReset {
+                ldebug!(" ws tls fail {} via {}: {}", domain, dial_addr, e);
             }
-            Err(_) => {
-                ldebug!(" ws tls fail {} via {}: timeout", domain, dial_addr);
-                return Err(WsError::Timeout);
-            }
-        };
+            return Err(WsError::Io(e));
+        }
+        Err(_) => {
+            ldebug!(" ws tls fail {} via {}: timeout", domain, dial_addr);
+            return Err(WsError::Timeout);
+        }
+    };
 
     let (read_half, write_half) = tokio::io::split(tls_conn);
     handshake_tls(read_half, write_half, domain, path, timeout).await
@@ -898,36 +914,28 @@ pub async fn connect_one_ws_full(
     path: &str,
     timeout: f64,
 ) -> Option<RawWebSocket> {
-    // Поведение pool._connect_one: сначала fronting (sni=sprinthost.ru),
-    // затем обычное соединение; Timeout/Reset → fronting fallback.
     let fronting_first = crate::proxy::ws_pool_fronting_first();
-    for d in domains {
-        if fronting_first {
-            if let Some(ws) = connect_fronted(ip, d, path).await {
+    for domain in domains {
+        for fronted in [fronting_first, !fronting_first] {
+            let sni = if fronted { Some(FRONTING_SNI) } else { None };
+            let timeout = if fronted {
+                WS_POOL_FRONTING_TIMEOUT
+            } else {
+                timeout
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs_f64(timeout),
+                ws_connect_full_opts(ip, domain, path, timeout, sni, Some(true)),
+            )
+            .await;
+            if let Ok(Ok(ws)) = result {
+                crate::proxy::set_ws_pool_fronting_first(fronted);
+                if fronted {
+                    STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
+                }
                 return Some(ws);
             }
-        }
-        match ws_connect_full_opts(ip, d, path, timeout, None, Some(true)).await {
-            Ok(ws) => {
-                crate::proxy::set_ws_pool_fronting_first(false);
-                return Some(ws);
-            }
-            Err(WsError::Timeout) | Err(WsError::Io(_)) => {
-                if fronting_first {
-                    // как в оригинале: при fronting-first таймаут → сразу fronted
-                    return connect_fronted(ip, d, path).await;
-                }
-                if let Some(ws) = connect_fronted(ip, d, path).await {
-                    return Some(ws);
-                }
-            }
-            Err(WsError::Handshake(h)) => {
-                if h.is_redirect() {
-                    continue;
-                }
-                return None;
-            }
-            Err(_) => return None,
+            STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
     None
@@ -935,7 +943,16 @@ pub async fn connect_one_ws_full(
 
 pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWebSocket> {
     let path = if path.is_empty() { WS_PATH } else { path };
-    match ws_connect_full_opts(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI), Some(true)).await {
+    match ws_connect_full_opts(
+        ip,
+        domain,
+        path,
+        WS_POOL_FRONTING_TIMEOUT,
+        Some(FRONTING_SNI),
+        Some(true),
+    )
+    .await
+    {
         Ok(ws) => {
             STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
             crate::proxy::set_ws_pool_fronting_first(true);

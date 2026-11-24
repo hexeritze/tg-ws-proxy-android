@@ -16,11 +16,11 @@ object ProxyController {
         settingsStore.migrateLegacyDefaults()
         val portText = settingsStore.port.first()
         val port = portText.toIntOrNull()
-        if (port == null) {
+        if (port == null || port !in 1..65535) {
             if (showInvalidPortToast) {
                 Toast.makeText(context, context.getString(R.string.invalid_port), Toast.LENGTH_SHORT).show()
             }
-            ProxyTileService.requestSync(context)
+            ProxyTileSync.requestSync(context)
             return false
         }
 
@@ -32,6 +32,8 @@ object ProxyController {
         val customCfDomainEnabled = settingsStore.customCfDomainEnabled.first()
         val customCfDomain = settingsStore.customCfDomain.first().trim()
         val secretKey = ensureSecretKey(settingsStore)
+        val options = settingsStore.coreOptions.first()
+        val verbose = settingsStore.logShowDebug.first()
 
         val parsedIps = buildList {
             if (!isDcAuto) {
@@ -68,9 +70,17 @@ object ProxyController {
                     if (customCfDomainEnabled && cfEnabled) customCfDomain else ""
                 )
                 putExtra(ProxyService.EXTRA_SECRET_KEY, secretKey)
+                putExtra(ProxyService.EXTRA_H2, options.h2)
+                putExtra(ProxyService.EXTRA_WORKERS, options.workers)
+                putExtra(ProxyService.EXTRA_NO_SECURE, options.noSecure)
+                putExtra(ProxyService.EXTRA_TEST_DC, options.testDc)
+                putExtra(ProxyService.EXTRA_FAKE_TLS, options.fakeTlsDomain.trim())
+                putExtra(ProxyService.EXTRA_PROXY_PROTOCOL, options.proxyProtocol)
+                putExtra(ProxyService.EXTRA_BUFFER_KB, options.bufferKb)
+                putExtra(ProxyService.EXTRA_VERBOSE, verbose)
             }
         )
-        ProxyTileService.requestSync(context)
+        ProxyTileSync.requestSync(context)
         return true
     }
 
@@ -80,7 +90,7 @@ object ProxyController {
                 action = ProxyService.ACTION_STOP
             }
         )
-        ProxyTileService.requestSync(context)
+        ProxyTileSync.requestSync(context)
     }
 
     private suspend fun ensureSecretKey(settingsStore: SettingsStore): String {

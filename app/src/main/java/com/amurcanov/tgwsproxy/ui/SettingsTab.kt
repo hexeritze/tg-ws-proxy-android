@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.amurcanov.tgwsproxy.R
 import com.amurcanov.tgwsproxy.ProxyService
 import com.amurcanov.tgwsproxy.SettingsStore
 import kotlinx.coroutines.Job
@@ -408,6 +409,20 @@ fun SettingsTab(settingsStore: SettingsStore) {
                     enabled = !isRunning
                 )
             }
+
+            OutlinedTextField(
+                value = customCfDomain,
+                onValueChange = {
+                    customCfDomain = it
+                    customCfDomainEnabled = it.isNotBlank()
+                    scheduleSave()
+                },
+                label = { Text(stringResource(R.string.core_cf_domains)) },
+                enabled = !isRunning && cfEnabled,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            CoreSettings(settingsStore, enabled = !isRunning, cfEnabled = cfEnabled)
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
 

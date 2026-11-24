@@ -14,7 +14,18 @@ import kotlinx.coroutines.flow.map
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "proxy_settings")
 
-class SettingsStore(private val context: Context) {
+data class CoreOptions(
+    val h2: Boolean = true,
+    val workers: String = "",
+    val noSecure: Boolean = false,
+    val testDc: Boolean = false,
+    val fakeTlsDomain: String = "",
+    val proxyProtocol: Boolean = false,
+    val bufferKb: Int = 256
+)
+
+class SettingsStore(context: Context) {
+    private val context = context.applicationContext
 
     companion object {
         const val DEFAULT_DIRECT_DC2_IP = "149.154.167.220"
@@ -59,6 +70,30 @@ class SettingsStore(private val context: Context) {
         val UPDATE_DIALOG_LAST_ACTION_AT = longPreferencesKey("update_dialog_last_action_at")
         val DIRECT_DC_DEFAULTS_MIGRATED = booleanPreferencesKey("direct_dc_defaults_migrated")
         val DIRECT_DC_DEFAULTS_V2_MIGRATED = booleanPreferencesKey("direct_dc_defaults_v2_migrated")
+    }
+
+    val coreOptions: Flow<CoreOptions> = context.dataStore.data.map { preferences ->
+        CoreOptions(
+            h2 = preferences[booleanPreferencesKey("cf_h2_media")] ?: true,
+            workers = preferences[stringPreferencesKey("cf_worker_domains")] ?: "",
+            noSecure = preferences[booleanPreferencesKey("no_secure")] ?: false,
+            testDc = preferences[booleanPreferencesKey("force_test_dc")] ?: false,
+            fakeTlsDomain = preferences[stringPreferencesKey("fake_tls_domain")] ?: "",
+            proxyProtocol = preferences[booleanPreferencesKey("proxy_protocol")] ?: false,
+            bufferKb = preferences[intPreferencesKey("buffer_kb")] ?: 256
+        )
+    }
+
+    suspend fun saveCoreOptions(options: CoreOptions) {
+        context.dataStore.edit {
+            it[booleanPreferencesKey("cf_h2_media")] = options.h2
+            it[stringPreferencesKey("cf_worker_domains")] = options.workers
+            it[booleanPreferencesKey("no_secure")] = options.noSecure
+            it[booleanPreferencesKey("force_test_dc")] = options.testDc
+            it[stringPreferencesKey("fake_tls_domain")] = options.fakeTlsDomain
+            it[booleanPreferencesKey("proxy_protocol")] = options.proxyProtocol
+            it[intPreferencesKey("buffer_kb")] = options.bufferKb.coerceIn(4, 4096)
+        }
     }
 
     val isReady: Flow<Boolean> = context.dataStore.data.map { true }

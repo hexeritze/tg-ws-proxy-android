@@ -8,6 +8,7 @@ plugins {
 android {
     namespace = "com.amurcanov.tgwsproxy"
     compileSdk = 35
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.amurcanov.tgwsproxy"
@@ -121,7 +122,7 @@ android {
     }
     sourceSets {
         getByName("main") {
-            jniLibs.srcDirs("src/main/jniLibs")
+            jniLibs.setSrcDirs(listOf(layout.buildDirectory.dir("generated/rustJniLibs")))
         }
     }
 }
@@ -146,3 +147,53 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.appcompat:appcompat:1.6.1")
 }
+
+// Build from Rust sources so an APK always contains the C ABI used by NativeProxy.
+val nativeOutput = layout.buildDirectory.dir("generated/rustJniLibs")
+val cargoOutput = rootProject.layout.projectDirectory.dir("target")
+val ndkDirectory = androidComponents.sdkComponents.ndkDirectory
+val hostSystem = System.getProperty("os.name").lowercase()
+val ndkHost = when {
+    hostSystem.contains("windows") -> "windows-x86_64"
+    hostSystem.contains("mac") -> "darwin-x86_64"
+    else -> "linux-x86_64"
+}
+val clangSuffix = if (hostSystem.contains("windows")) ".cmd" else ""
+val executableSuffix = if (hostSystem.contains("windows")) ".exe" else ""
+val buildRust = tasks.register<Exec>("buildRust") {
+    workingDir(rootProject.layout.projectDirectory)
+    inputs.files(rootProject.fileTree("src") { include("**/*.rs") })
+    inputs.files(rootProject.file("Cargo.toml"), rootProject.file("Cargo.lock"))
+    inputs.property("ndkVersion", android.ndkVersion.orEmpty())
+    outputs.files(
+        cargoOutput.file("aarch64-linux-android/release/libtgwsproxy.so"),
+        cargoOutput.file("armv7-linux-androideabi/release/libtgwsproxy.so")
+    )
+    commandLine("cargo", "build", "--locked", "--release", "--jobs", "4",
+        "--target", "aarch64-linux-android", "--target", "armv7-linux-androideabi")
+    val ndkPath = ndkDirectory
+    val host = ndkHost
+    val clangExtension = clangSuffix
+    val binaryExtension = executableSuffix
+    val targetPath = cargoOutput.asFile.absolutePath
+    doFirst {
+        val bin = ndkPath.get().dir("toolchains/llvm/prebuilt/$host/bin").asFile
+        val arm64 = bin.resolve("aarch64-linux-android24-clang$clangExtension").absolutePath
+        val arm32 = bin.resolve("armv7a-linux-androideabi21-clang$clangExtension").absolutePath
+        val archiver = bin.resolve("llvm-ar$binaryExtension").absolutePath
+        environment("CARGO_TARGET_DIR", targetPath)
+        environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", arm64)
+        environment("CC_aarch64_linux_android", arm64)
+        environment("AR_aarch64_linux_android", archiver)
+        environment("CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER", arm32)
+        environment("CC_armv7_linux_androideabi", arm32)
+        environment("AR_armv7_linux_androideabi", archiver)
+    }
+}
+val syncRustLibraries = tasks.register<Sync>("syncRustLibraries") {
+    dependsOn(buildRust)
+    from(cargoOutput.file("aarch64-linux-android/release/libtgwsproxy.so")) { into("arm64-v8a") }
+    from(cargoOutput.file("armv7-linux-androideabi/release/libtgwsproxy.so")) { into("armeabi-v7a") }
+    into(nativeOutput)
+}
+tasks.named("preBuild") { dependsOn(syncRustLibraries) }

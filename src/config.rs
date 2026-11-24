@@ -14,13 +14,6 @@ pub const DEFAULT_RECV_BUF: usize = 256 * 1024;
 pub const DEFAULT_SEND_BUF: usize = 256 * 1024;
 pub const DEFAULT_POOL_SZ: i32 = 4;
 
-// proxy/tg_ws_proxy.py: IP_FAIL_COOLDOWN / DC_FAIL_COOLDOWN / WS_FAIL_TIMEOUT
-pub const IP_FAIL_COOLDOWN: f64 = 3600.0;
-pub const DC_FAIL_COOLDOWN: f64 = 60.0;
-pub const WS_FAIL_TIMEOUT: f64 = 2.0;
-// Прямой WS-коннект при отсутствии cooldown — 5.0 как в оригинале.
-pub const WS_DIRECT_TIMEOUT: f64 = 5.0;
-
 // proxy/utils.py — MTProto handshake layout
 pub const HANDSHAKE_LEN: usize = 64;
 pub const SKIP_LEN: usize = 8;
@@ -41,8 +34,6 @@ pub const PROTO_PADDED_INTERMEDIATE_INT: u32 = 0xDDDDDDDD;
 // proxy/utils.py — зарезервированные префиксы relay_init
 pub const RESERVED_FIRST_BYTE: u8 = 0xEF;
 
-pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(120);
-pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 pub const WS_BRIDGE_CHUNK_SIZE: usize = 64 * 1024;
@@ -82,7 +73,8 @@ pub static BUFFER_SIZE: AtomicI32 = AtomicI32::new(256 * 1024);
 pub static POOL_SIZE: AtomicI32 = AtomicI32::new(DEFAULT_POOL_SZ);
 pub static LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
 // proxy/config.py::ProxyConfig — мобильные эквиваленты
-pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(true);
+pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(false);
+pub static CF_H2_MEDIA: AtomicBool = AtomicBool::new(true);
 pub static FORCE_TEST_DC: AtomicBool = AtomicBool::new(false);
 pub static PROXY_PROTOCOL: AtomicBool = AtomicBool::new(false);
 
@@ -94,7 +86,10 @@ pub struct Cfproxy429State {
 
 impl Default for Cfproxy429State {
     fn default() -> Self {
-        Cfproxy429State { until: None, strikes: 0 }
+        Cfproxy429State {
+            until: None,
+            strikes: 0,
+        }
     }
 }
 
@@ -118,10 +113,8 @@ pub static CFPROXY: Lazy<RwLock<CfproxyConfig>> = Lazy::new(|| {
 });
 
 // proxy/config.py: cfproxy_worker_domains + fake_tls_domain
-pub static CF_WORKER_DOMAINS: Lazy<RwLock<Vec<String>>> =
-    Lazy::new(|| RwLock::new(Vec::new()));
-pub static FAKE_TLS_DOMAIN: Lazy<RwLock<String>> =
-    Lazy::new(|| RwLock::new(String::new()));
+pub static CF_WORKER_DOMAINS: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock::new(Vec::new()));
+pub static FAKE_TLS_DOMAIN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 
 pub static CFPROXY_429: Lazy<RwLock<HashMap<String, Cfproxy429State>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -130,8 +123,13 @@ pub const CFPROXY_DOMAINS_URL: &str =
     "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt";
 
 // MTProto proxy secret
-pub static PROXY_SECRET: Lazy<RwLock<String>> =
-    Lazy::new(|| RwLock::new("00000000000000000000000000000000".to_string()));
+pub static PROXY_SECRET: Lazy<RwLock<String>> = Lazy::new(|| {
+    RwLock::new({
+        let mut secret = [0; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut secret);
+        hex::encode(secret)
+    })
+});
 
 // proxy/config.py::_CFPROXY_ENC — полный список из 20 доменов оригинала.
 pub static CFPROXY_ENC: &[&str] = &[
@@ -189,44 +187,7 @@ pub static DC_OVERRIDES: Lazy<HashMap<i32, i32>> = Lazy::new(|| {
     m
 });
 
-// Ключ состояния DC: (dc, is_media, is_test) — аналог строки
-// f'{dc}{"t" if is_test else ""}{"m" if is_media else ""}' из оригинала.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct DcKey {
-    pub dc: i32,
-    pub is_media: i32,
-    pub is_test: i32,
-}
-
-impl DcKey {
-    pub fn new(dc: i32, is_media: bool, is_test: bool) -> Self {
-        DcKey {
-            dc,
-            is_media: if is_media { 1 } else { 0 },
-            is_test: if is_test { 1 } else { 0 },
-        }
-    }
-
-    pub fn as_str_key(&self) -> String {
-        format!(
-            "{}{}{}",
-            self.dc,
-            if self.is_test != 0 { "t" } else { "" },
-            if self.is_media != 0 { "m" } else { "" }
-        )
-    }
-}
-
-// Global state — proxy/tg_ws_proxy.py: ws_blacklist / dc_fail_until / ip_fail_until
 pub static DC_OPT: Lazy<RwLock<HashMap<i32, String>>> = Lazy::new(|| RwLock::new(HashMap::new()));
-pub static WS_BLACKLIST: Lazy<RwLock<HashMap<DcKey, bool>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-pub static DC_FAIL_UNTIL: Lazy<RwLock<HashMap<DcKey, f64>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-pub static IP_FAIL_UNTIL: Lazy<RwLock<HashMap<String, f64>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-
-pub static ZERO64: [u8; 64] = [0u8; 64];
 
 // ---------------------------------------------------------------------------
 // Domain validation — proxy/config.py::_is_valid_domain / _normalize_domain_pool
@@ -327,6 +288,10 @@ pub struct Stats {
     pub connections_tcp_fallback: AtomicI64,
     pub connections_cfproxy: AtomicI64,
     pub connections_fronting: AtomicI64,
+    pub connections_h2: AtomicI64,
+    pub h2_requests: AtomicI64,
+    pub h2_errors: AtomicI64,
+    pub h2_replays: AtomicI64,
     pub connections_bad: AtomicI64,
     pub connections_masked: AtomicI64,
     pub connections_http_reject: AtomicI64,
@@ -361,12 +326,13 @@ impl Stats {
             "n/a".to_string()
         };
         format!(
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
+            "total={} active={} ws={} tcp_fb={} cf={} h2={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
             self.connections_tcp_fallback.load(Ordering::Relaxed),
             self.connections_cfproxy.load(Ordering::Relaxed),
+            self.connections_h2.load(Ordering::Relaxed),
             self.connections_fronting.load(Ordering::Relaxed),
             self.connections_bad.load(Ordering::Relaxed),
             self.connections_masked.load(Ordering::Relaxed),
@@ -379,7 +345,10 @@ impl Stats {
     }
 
     pub fn summary_ru(&self) -> String {
-        let mut parts = vec![format!("акт:{}", self.connections_active.load(Ordering::Relaxed))];
+        let mut parts = vec![format!(
+            "акт:{}",
+            self.connections_active.load(Ordering::Relaxed)
+        )];
         let ws = self.connections_ws.load(Ordering::Relaxed);
         if ws > 0 {
             parts.push(format!("ws:{}", ws));
@@ -410,6 +379,10 @@ impl Stats {
         self.connections_ws.store(0, Ordering::Relaxed);
         self.connections_tcp_fallback.store(0, Ordering::Relaxed);
         self.connections_cfproxy.store(0, Ordering::Relaxed);
+        self.connections_h2.store(0, Ordering::Relaxed);
+        self.h2_requests.store(0, Ordering::Relaxed);
+        self.h2_errors.store(0, Ordering::Relaxed);
+        self.h2_replays.store(0, Ordering::Relaxed);
         self.connections_fronting.store(0, Ordering::Relaxed);
         self.connections_bad.store(0, Ordering::Relaxed);
         self.connections_masked.store(0, Ordering::Relaxed);
@@ -444,13 +417,16 @@ pub fn human_bytes(n: i64) -> String {
 #[cfg(target_os = "android")]
 fn android_log_line(line: &str) {
     use std::ffi::CString;
+    #[link(name = "log")]
     unsafe extern "C" {
         fn __android_log_print(prio: i32, tag: *const i8, fmt: *const i8, ...) -> i32;
     }
     const ANDROID_LOG_INFO: i32 = 4;
-    if let (Ok(tag), Ok(fmt), Ok(msg)) =
-        (CString::new("TgWsProxy"), CString::new("%s"), CString::new(line))
-    {
+    if let (Ok(tag), Ok(fmt), Ok(msg)) = (
+        CString::new("TgWsProxy"),
+        CString::new("%s"),
+        CString::new(line),
+    ) {
         unsafe {
             __android_log_print(
                 ANDROID_LOG_INFO,
@@ -514,9 +490,7 @@ fn is_likely_domain(token: &str) -> bool {
         return false;
     }
     parts.iter().all(|p| {
-        !p.is_empty()
-            && p.len() <= 63
-            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        !p.is_empty() && p.len() <= 63 && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     })
 }
 
@@ -568,7 +542,13 @@ macro_rules! lwarn  { ($($a:tt)*) => { $crate::config::log_warn(&format!($($a)*)
 #[macro_export]
 macro_rules! lerror { ($($a:tt)*) => { $crate::config::log_error(&format!($($a)*)) }; }
 #[macro_export]
-macro_rules! ldebug { ($($a:tt)*) => { $crate::config::log_debug(&format!($($a)*)) }; }
+macro_rules! ldebug {
+    ($($a:tt)*) => {
+        if $crate::config::LOG_VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+            $crate::config::log_debug(&format!($($a)*));
+        }
+    };
+}
 
 pub fn init_logging(verbose: bool) {
     LOG_VERBOSE.store(verbose, Ordering::Relaxed);

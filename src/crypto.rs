@@ -1,53 +1,30 @@
-use crate::config::ZERO64;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
 type Aes256Ctr = ctr::Ctr64BE<aes::Aes256>;
 
 // ---------------------------------------------------------------------------
-// TrackedStream — эмулирует Go cipher.Stream с поддержкой Clone() через
-// "промотку" keystream на processed байт.
+// AES-CTR state is cloned directly, including its partial-block position.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct TrackedStream {
-    key: Vec<u8>,
-    iv: Vec<u8>,
-    processed: u64,
     stream: Aes256Ctr,
 }
 
 impl TrackedStream {
     pub fn new(key: &[u8], iv: &[u8]) -> TrackedStream {
         let stream = Aes256Ctr::new(key.into(), iv.into());
-        TrackedStream {
-            key: key.to_vec(),
-            iv: iv.to_vec(),
-            processed: 0,
-            stream,
-        }
+        TrackedStream { stream }
     }
 
     // XOR in place (dst == src в нашем использовании)
     pub fn xor(&mut self, data: &mut [u8]) {
         self.stream.apply_keystream(data);
-        self.processed += data.len() as u64;
     }
 
     pub fn clone_state(&self) -> TrackedStream {
-        let mut clone_stream = Aes256Ctr::new(self.key.as_slice().into(), self.iv.as_slice().into());
-        let mut dummy = [0u8; 16384];
-        let mut rem = self.processed;
-        while rem > 0 {
-            let n = if rem > 16384 { 16384 } else { rem as usize };
-            clone_stream.apply_keystream(&mut dummy[..n]);
-            rem -= n as u64;
-        }
-        TrackedStream {
-            key: self.key.clone(),
-            iv: self.iv.clone(),
-            processed: self.processed,
-            stream: clone_stream,
-        }
+        self.clone()
     }
 }
 
@@ -72,7 +49,6 @@ pub fn proto_tag_to_type(proto: u32) -> i32 {
 }
 
 pub struct MsgSplitter {
-    stream: Aes256Ctr,
     proto_type: i32,
     cipher_buf: Vec<u8>,
     plain_buf: Vec<u8>,
@@ -80,24 +56,16 @@ pub struct MsgSplitter {
 }
 
 impl MsgSplitter {
-    pub fn new(init_data: &[u8], proto: u32) -> Option<MsgSplitter> {
-        if init_data.len() < 56 {
-            return None;
-        }
-        let mut stream = Aes256Ctr::new(init_data[8..40].into(), init_data[40..56].into());
-        let mut skip = [0u8; 64];
-        skip.copy_from_slice(&ZERO64);
-        stream.apply_keystream(&mut skip);
-        Some(MsgSplitter {
-            stream,
+    pub fn new(proto: u32) -> MsgSplitter {
+        MsgSplitter {
             proto_type: proto_tag_to_type(proto),
             cipher_buf: Vec::new(),
             plain_buf: Vec::new(),
             disabled: false,
-        })
+        }
     }
 
-    pub fn split(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+    pub fn split(&mut self, chunk: &[u8], plain: &[u8]) -> Vec<Vec<u8>> {
         if chunk.is_empty() {
             return Vec::new();
         }
@@ -105,10 +73,14 @@ impl MsgSplitter {
             return vec![chunk.to_vec()];
         }
 
+        if self.cipher_buf.len() + chunk.len() > 4 * 1024 * 1024 + 260 {
+            self.disabled = true;
+            let mut tail = self.flush();
+            tail.push(chunk.to_vec());
+            return tail;
+        }
         self.cipher_buf.extend_from_slice(chunk);
-        let mut decrypted = chunk.to_vec();
-        self.stream.apply_keystream(&mut decrypted);
-        self.plain_buf.extend_from_slice(&decrypted);
+        self.plain_buf.extend_from_slice(plain);
 
         // Порт MsgSplitter.split из proxy/bridge.py: идём по буферу с offset,
         // а не удаляем каждый пакет с начала (иначе O(N^2) на чанке с кучей

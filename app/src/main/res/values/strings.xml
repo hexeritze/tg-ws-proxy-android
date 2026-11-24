@@ -127,4 +127,12 @@
     <string name="interval_never">Never</string>
     <string name="interval_hours">%1$d h</string>
     <string name="port_is_not_available">Port %1$d is in use, please try another one</string>
+    <string name="core_cf_domains">CF proxy domains (comma-separated, empty for automatic)</string>
+    <string name="core_h2">Media multiplexing (HTTP/2)</string>
+    <string name="core_workers">Cloudflare Worker domains (comma-separated)</string>
+    <string name="core_no_secure">Use port 80 for CF proxy and Workers</string>
+    <string name="core_test_dc">Use Telegram test data centers</string>
+    <string name="core_fake_tls">FakeTLS domain (empty to disable)</string>
+    <string name="core_proxy_protocol">Require PROXY protocol v1 from an upstream proxy</string>
+    <string name="core_buffer">Socket buffer · %1$d KB</string>
 </resources>

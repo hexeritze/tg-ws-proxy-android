@@ -1,13 +1,14 @@
+pub mod balancer;
+pub mod cf_h2;
 pub mod cfproxy;
 pub mod config;
 pub mod crypto;
 pub mod faketls;
 pub mod proxy;
 pub mod ws;
-pub mod balancer;
 
 use config::*;
-use once_cell::sync::OnceCell;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use proxy::{parse_cidr_pool, run_proxy, ProxyPools};
 use std::collections::HashMap;
@@ -18,32 +19,14 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
-// Глобальный рантайм — никогда не дропается
-static RUNTIME: OnceCell<Runtime> = OnceCell::new();
-
 struct ProxyState {
-    pools: Arc<ProxyPools>,
+    runtime: Runtime,
     handle: tokio::task::JoinHandle<()>,
-    cancel_tasks: CancellationToken,
+    pools: Arc<ProxyPools>,
+    cancel: CancellationToken,
 }
 
-static STATE: OnceCell<Mutex<Option<ProxyState>>> = OnceCell::new();
-
-fn state_cell() -> &'static Mutex<Option<ProxyState>> {
-    STATE.get_or_init(|| Mutex::new(None))
-}
-
-fn runtime() -> &'static Runtime {
-    RUNTIME.get_or_init(|| {
-        // Многопоточный рантайм, кол-во воркеров адекватно мобиле
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .thread_name("tgwsproxy-rt")
-            .enable_all()
-            .build()
-            .expect("failed to build global tokio runtime")
-    })
-}
+static STATE: Lazy<Mutex<Option<ProxyState>>> = Lazy::new(|| Mutex::new(None));
 
 fn cstr_to_string(p: *const c_char) -> String {
     if p.is_null() {
@@ -66,14 +49,16 @@ pub unsafe extern "C" fn StartProxy(
     c_secret: *const c_char,
     verbose: c_int,
 ) -> c_int {
-    let cell = state_cell();
-    let mut guard = cell.lock();
+    let mut guard = STATE.lock();
 
     if guard.is_some() {
         return -1;
     }
 
     let host = cstr_to_string(c_host);
+    if !(1..=65535).contains(&port) {
+        return -2;
+    }
     let go_port = port as u16;
     let dc_ips_str = cstr_to_string(c_dc_ips);
     let secret_str = cstr_to_string(c_secret);
@@ -81,6 +66,7 @@ pub unsafe extern "C" fn StartProxy(
 
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
+    cfproxy::reset_cf_timeouts();
 
     if secret_str.len() == 32 {
         if hex::decode(&secret_str).is_ok() {
@@ -92,7 +78,16 @@ pub unsafe extern "C" fn StartProxy(
 
     let dc_opt_map: HashMap<i32, String> = parse_cidr_pool(&dc_ips_str);
 
-    let rt = runtime();
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .thread_name("tgwsproxy-rt")
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return -3,
+    };
     let cancel_tasks = CancellationToken::new();
     let pools = Arc::new(ProxyPools::new(cancel_tasks.clone()));
 
@@ -106,18 +101,24 @@ pub unsafe extern "C" fn StartProxy(
 
     let handle = rt.spawn(async move {
         // Предварительный bind для сигнала готовности
-        let addr = format!("{}:{}", host_task, go_port);
-        match tokio::net::TcpListener::bind(&addr).await {
+        match tokio::net::TcpListener::bind((host_task.as_str(), go_port)).await {
             Ok(listener) => {
                 let _ = tx.send(Ok(()));
-                if let Err(e) =
-                    run_proxy(pools_task, host_task, go_port, map_task, cancel_root, listener).await
+                if let Err(e) = run_proxy(
+                    pools_task,
+                    host_task,
+                    go_port,
+                    map_task,
+                    cancel_root,
+                    listener,
+                )
+                .await
                 {
-                    lerror!("listen on {}: {}", addr, e);
+                    lerror!("proxy listener failed: {}", e);
                 }
             }
             Err(e) => {
-                let _ = tx.send(Err(format!("listen on {}: {}", addr, e)));
+                let _ = tx.send(Err(format!("listen on {}:{}: {}", host_task, go_port, e)));
             }
         }
     });
@@ -136,9 +137,10 @@ pub unsafe extern "C" fn StartProxy(
     }
 
     *guard = Some(ProxyState {
+        runtime: rt,
         pools,
         handle,
-        cancel_tasks,
+        cancel: cancel_tasks,
     });
 
     0
@@ -146,38 +148,34 @@ pub unsafe extern "C" fn StartProxy(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn StopProxy() -> c_int {
-    let cell = state_cell();
-    let mut guard = cell.lock();
+    let mut guard = STATE.lock();
 
     let state = match guard.take() {
         Some(s) => s,
         None => return -1,
     };
 
-    // graceful shutdown — НЕ дропаем рантайм
-    linfo!("StopProxy: cancelling all tasks");
-    state.cancel_tasks.cancel();
-
-    let rt = runtime();
-    let pools = state.pools.clone();
-    let handle = state.handle;
-    rt.block_on(async move {
-        linfo!("StopProxy: waiting for proxy tasks to finish (max 2s)");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        linfo!("StopProxy: closing pool connections");
-        pools.close_all().await;
-        pools.reset().await;
-        linfo!("StopProxy: done");
+    state.cancel.cancel();
+    state.runtime.block_on(async {
+        let mut handle = state.handle;
+        if tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
+        state.pools.close_all().await;
     });
-
+    state
+        .runtime
+        .shutdown_timeout(std::time::Duration::from_secs(1));
+    cfproxy::reset_cf_timeouts();
     STATS.reset();
-    WS_BLACKLIST.write().clear();
-    DC_FAIL_UNTIL.write().clear();
-    IP_FAIL_UNTIL.write().clear();
     cfproxy::clear_cfproxy_429_cooldowns();
-    proxy::set_ws_pool_fronting_first(true);
+    proxy::set_ws_pool_fronting_first(false);
 
-    linfo!("StopProxy: exit");
+    ldebug!("StopProxy: exit");
     0
 }
 
@@ -263,6 +261,11 @@ pub extern "C" fn SetDisableSecure(v: c_int) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn SetCfH2Media(enabled: c_int) {
+    CF_H2_MEDIA.store(enabled != 0, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn SetForceTestDc(v: c_int) {
     // --force-test-dc: весь трафик на тестовые DC.
     FORCE_TEST_DC.store(v != 0, Ordering::Relaxed);
@@ -302,7 +305,14 @@ pub extern "C" fn GetSecretWithPrefix() -> *mut c_char {
     let full = if ftls.is_empty() {
         format!("dd{}", sec)
     } else {
-        format!("ee{}{}", sec, ftls.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>())
+        format!(
+            "ee{}{}",
+            sec,
+            ftls.as_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        )
     };
     CString::new(full).unwrap_or_default().into_raw()
 }

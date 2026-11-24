@@ -127,4 +127,12 @@
     <string name="interval_never">Никогда</string>
     <string name="interval_hours">%1$d ч</string>
     <string name="port_is_not_available">"Порт %1$d используется, пожалуйста попробуйте другой "</string>
+    <string name="core_cf_domains">Домены CF proxy (через запятую, пусто — автоматически)</string>
+    <string name="core_h2">Мультиплексирование медиа (HTTP/2)</string>
+    <string name="core_workers">Домены Cloudflare Worker (через запятую)</string>
+    <string name="core_no_secure">Порт 80 для CF proxy и Worker</string>
+    <string name="core_test_dc">Тестовые дата-центры Telegram</string>
+    <string name="core_fake_tls">Домен FakeTLS (пусто — выключено)</string>
+    <string name="core_proxy_protocol">Требовать PROXY protocol v1 от вышестоящего прокси</string>
+    <string name="core_buffer">Буфер сокета · %1$d КБ</string>
 </resources>

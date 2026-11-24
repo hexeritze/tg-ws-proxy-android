@@ -18,6 +18,7 @@ interface ProxyLibrary : Library {
     fun SetCfWorkerDomains(domains: String)
     fun SetFakeTlsDomain(domain: String)
     fun SetDisableSecure(v: Int)
+    fun SetCfH2Media(enabled: Int)
     fun SetForceTestDc(v: Int)
     fun SetProxyProtocol(v: Int)
     fun GetSecretWithPrefix(): Pointer?
@@ -66,6 +67,10 @@ object NativeProxy {
         ProxyLibrary.INSTANCE.SetDisableSecure(if (v) 1 else 0)
     }
 
+    fun setCfH2Media(enabled: Boolean) {
+        ProxyLibrary.INSTANCE.SetCfH2Media(if (enabled) 1 else 0)
+    }
+
     fun setForceTestDc(v: Boolean) {
         ProxyLibrary.INSTANCE.SetForceTestDc(if (v) 1 else 0)
     }
@@ -77,15 +82,11 @@ object NativeProxy {
     /** Returns the full secret with correct prefix (dd or ee+domain_hex) */
     fun getSecretWithPrefix(): String? {
         val ptr = ProxyLibrary.INSTANCE.GetSecretWithPrefix() ?: return null
-        val res = ptr.getString(0)
-        ProxyLibrary.INSTANCE.FreeString(ptr)
-        return res
+        return try { ptr.getString(0) } finally { ProxyLibrary.INSTANCE.FreeString(ptr) }
     }
 
     fun getStats(): String? {
         val ptr = ProxyLibrary.INSTANCE.GetStats() ?: return null
-        val res = ptr.getString(0)
-        ProxyLibrary.INSTANCE.FreeString(ptr)
-        return res
+        return try { ptr.getString(0) } finally { ProxyLibrary.INSTANCE.FreeString(ptr) }
     }
 }

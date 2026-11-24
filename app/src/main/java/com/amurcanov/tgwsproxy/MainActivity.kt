@@ -64,7 +64,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.Channel.Factory.BUFFERED
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.awaitCancellation
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
@@ -193,9 +197,12 @@ fun MainContent(settingsStore: SettingsStore) {
     val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
     val navOverlayReserve = safeBottomInset + 96.dp
 
-    DisposableEffect(Unit) {
-        LogManager.startListening()
-        onDispose { LogManager.stopListening() }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            LogManager.startListening()
+            try { awaitCancellation() } finally { LogManager.stopListening() }
+        }
     }
 
     LaunchedEffect(updateCheckIntervalHours, updateLastCheckAt) {
@@ -579,77 +586,50 @@ private fun AppBackdrop(modifier: Modifier = Modifier) {
     }
 }
 
-/**
- * Optimized LogManager: uses a Channel + batching approach to avoid
- * creating a new list on every single log line — reduces GC pressure
- * and eliminates UI jank caused by high-frequency log updates.
- *
- * Key optimizations:
- * - Channel-based buffering: log lines are queued, not applied immediately
- * - Batch processing: up to 20 lines applied per tick (every 150ms)
- * - Array-backed list with cap of 50: avoids growing/shrinking allocations
- * - Duplicate merging: last-entry count increment done in-place conceptually
- */
+// Logcat runs while the activity is visible and publishes bounded batches.
 object LogManager {
     val logs = MutableStateFlow<List<LogEntry>>(emptyList())
     private var job: Job? = null
     private var logcatProcess: Process? = null
     private val nextKey = AtomicLong(0)
+    private val emojiRegex = Regex("[\\x{1F300}-\\x{1F5FF}\\x{1F900}-\\x{1F9FF}\\x{1F600}-\\x{1F64F}\\x{1F680}-\\x{1F6FF}\\x{2600}-\\x{26FF}\\x{2700}-\\x{27BF}\\x{1F1E6}-\\x{1F1FF}\\x{1F191}-\\x{1F251}\\x{1F004}\\x{1F0CF}\\x{1F170}-\\x{1F171}\\x{1F17E}-\\x{1F17F}\\x{1F18E}\\x{3030}\\x{2B50}\\x{2B55}\\x{2934}-\\x{2935}\\x{2B05}-\\x{2B07}\\x{2B1B}-\\x{2B1C}\\x{3297}\\x{3299}\\x{303D}\\x{00A9}\\x{00AE}\\x{2122}\\x{23F3}\\x{24C2}\\x{23E9}-\\x{23EF}\\x{25B6}\\x{23F8}-\\x{23FA}⚠✅❌⚡🔥🔄🔗]")
 
-    // Buffered channel — absorbs bursts of log lines without blocking the reader
-    private val logChannel = Channel<LogEntry>(capacity = BUFFERED)
-
+    @Synchronized
     fun startListening() {
         if (job?.isActive == true) return
         job = CoroutineScope(Dispatchers.IO).launch {
-            // Start logcat reader coroutine
-            val readerJob = launch(Dispatchers.IO) {
-                try {
-                    val pid = android.os.Process.myPid()
-                    val process = ProcessBuilder("logcat", "-v", "tag", "--pid", pid.toString())
-                        .redirectErrorStream(true)
-                        .start()
-                        
+            val process = ProcessBuilder("logcat", "-v", "tag", "--pid", android.os.Process.myPid().toString())
+                .redirectErrorStream(true).start()
+            try {
+                synchronized(this@LogManager) {
+                    if (!isActive) { process.destroy(); return@launch }
                     logcatProcess = process
-                    
-                    process.inputStream.bufferedReader().use { reader ->
-                        while (isActive) {
-                            val line = try { reader.readLine() } catch (e: Exception) { null } ?: break
-                            val entry = parseLine(line) ?: continue
-                            logChannel.trySend(entry)
-                        }
-                    }
-                } catch (_: Exception) {
-                } finally {
-                    logcatProcess?.destroy()
-                    logcatProcess = null
                 }
-            }
-
-            // Batch consumer: collects queued entries and applies in batches
-            launch {
-                val pendingBatch = mutableListOf<LogEntry>()
-                while (isActive) {
-                    // Drain the channel (non-blocking)
-                    var received = logChannel.tryReceive()
-                    while (received.isSuccess) {
-                        pendingBatch.add(received.getOrThrow())
-                        if (pendingBatch.size >= 20) break // cap batch size
-                        received = logChannel.tryReceive()
+                val channel = Channel<LogEntry>(128, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+                launch {
+                    try {
+                        process.inputStream.bufferedReader().use { reader ->
+                            while (isActive) {
+                                val line = reader.readLine() ?: break
+                                parseLine(line)?.let { channel.trySend(it) }
+                            }
+                        }
+                    } finally { channel.close() }
+                }
+                for (first in channel) {
+                    val batch = mutableListOf(first)
+                    while (batch.size < 20) {
+                        batch.add(channel.tryReceive().getOrNull() ?: break)
                     }
-
-                    if (pendingBatch.isNotEmpty()) {
-                        // Apply batch to state — single list mutation
-                        logs.value = applyBatch(logs.value, pendingBatch)
-                        pendingBatch.clear()
-                    }
-
-                    // Throttle updates — 150ms between UI refreshes
+                    logs.value = applyBatch(logs.value, batch)
                     delay(150)
                 }
+            } finally {
+                process.destroy()
+                synchronized(this@LogManager) {
+                    if (logcatProcess === process) logcatProcess = null
+                }
             }
-
-            readerJob.join()
         }
     }
 
@@ -680,6 +660,7 @@ object LogManager {
         return result.toList()
     }
 
+    @Synchronized
     fun stopListening() {
         job?.cancel()
         job = null
@@ -735,7 +716,7 @@ object LogManager {
         }
 
         // Remove emojis and stickers
-        val emojiRegex = Regex("[\\x{1F300}-\\x{1F5FF}\\x{1F900}-\\x{1F9FF}\\x{1F600}-\\x{1F64F}\\x{1F680}-\\x{1F6FF}\\x{2600}-\\x{26FF}\\x{2700}-\\x{27BF}\\x{1F1E6}-\\x{1F1FF}\\x{1F191}-\\x{1F251}\\x{1F004}\\x{1F0CF}\\x{1F170}-\\x{1F171}\\x{1F17E}-\\x{1F17F}\\x{1F18E}\\x{3030}\\x{2B50}\\x{2B55}\\x{2934}-\\x{2935}\\x{2B05}-\\x{2B07}\\x{2B1B}-\\x{2B1C}\\x{3297}\\x{3299}\\x{303D}\\x{00A9}\\x{00AE}\\x{2122}\\x{23F3}\\x{24C2}\\x{23E9}-\\x{23EF}\\x{25B6}\\x{23F8}-\\x{23FA}⚠✅❌⚡🔥🔄🔗]")
+
         message = message.replace(emojiRegex, "").trim()
 
         val isEssential = listOf(
